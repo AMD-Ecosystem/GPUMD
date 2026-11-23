@@ -19,6 +19,11 @@ Major contributors:
 ------------------------------------------------------------------------------*/
 
 #pragma once
+#ifdef USE_HIP
+#include <hip/hip_runtime.h>
+#else
+#include <cuda_runtime.h>
+#endif
 #include <cmath>
 
 struct Spin_Wall {
