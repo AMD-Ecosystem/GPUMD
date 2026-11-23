@@ -19,10 +19,8 @@ Major contributors:
 ------------------------------------------------------------------------------*/
 
 #pragma once
-#ifdef USE_HIP
+#ifdef __HIPCC__
 #include <hip/hip_runtime.h>
-#else
-#include <cuda_runtime.h>
 #endif
 #include <cmath>
 
