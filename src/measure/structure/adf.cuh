@@ -44,18 +44,18 @@ public:
     Force& force);
 
   virtual void end_of_step(
-      const int number_of_steps,
-      int step,
-      const int fixed_group,
-      const int move_group,
-      const double global_time,
-      const double temperature,
-      Integrate& integrate,
-      Box& box,
-      std::vector<Group>& group,
-      GPU_Vector<double>& thermo,
-      Atom& atom,
-      Force& force);
+    const int number_of_steps,
+    int step,
+    const int fixed_group,
+    const int move_group,
+    const double global_time,
+    const double temperature,
+    Integrate& integrate,
+    Box& box,
+    std::vector<Group>& group,
+    GPU_Vector<double>& thermo,
+    Atom& atom,
+    Force& force);
 
   virtual void post_run(
     Atom& atom,
@@ -74,7 +74,7 @@ private:
   double rc_min_ = 0.0;
   double rc_max_ = 3.0;
 
-  std::vector<int> adf;
+  std::vector<unsigned long long> adf;
   std::vector<double> angle;
   std::vector<int> itype_cpu;
   std::vector<int> jtype_cpu;
@@ -84,7 +84,7 @@ private:
   std::vector<double> rc_min_k_cpu;
   std::vector<double> rc_max_k_cpu;
 
-  GPU_Vector<int> adf_gpu;
+  GPU_Vector<unsigned long long> adf_gpu;
   GPU_Vector<int> itype_gpu;
   GPU_Vector<int> jtype_gpu;
   GPU_Vector<int> ktype_gpu;

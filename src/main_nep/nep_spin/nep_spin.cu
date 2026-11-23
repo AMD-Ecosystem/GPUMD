@@ -1,7 +1,22 @@
 /*
     Copyright 2017 Zheyong Fan and GPUMD development team
-    This file is part of GPUMD and is distributed under LGPLv3 or later.
+    This file is part of GPUMD.
+    GPUMD is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+    GPUMD is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Lesser General Public License for more details.
+    You should have received a copy of the GNU Lesser General Public License
+    along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
 */
+
+/*----------------------------------------------------------------------------80
+Major contributors:
+  Chengbing Chen: Initial implementation.
+------------------------------------------------------------------------------*/
 
 #include "main_nep/common/nep_init.cuh"
 #include "main_nep/common/nep_io.cuh"
@@ -10,8 +25,10 @@
 #include "nep_spin.cuh"
 #include "spin_io.cuh"
 #include "utilities/error.cuh"
+#include "utilities/nep_spin/spin_warp.cuh"
 #include "utilities/nep_utilities.cuh"
 #include <algorithm>
+#include <type_traits>
 void NEP_Spin_Model::initialize(Spin_Parameters& para, int N, int deviceCount)
 {
   initialize_model(para);
@@ -81,11 +98,14 @@ void NEP_Spin_Model::initialize_compiled_kernel(const Spin_Parameters& para)
   if (para.nep_compile && para.prediction == 0) {
     CHECK(gpuSetDevice(0));
     auto config = make_nep_compile_config(para);
-    config.model_name = "Spin3";
-    config.source_file = "main_nep/nep/nep_specialized.cu";
+    config.model_name = "NEP-spin";
+    config.source_file = "main_nep/nep_spin/spin_structural_specialized.cu";
     compiled_kernel_.reset(new NEP_Compiled_Evaluation(config));
     if (!compiled_kernel_->is_valid())
       compiled_kernel_.reset();
+  }
+  if (para.nep_compile) {
+    CHECK(gpuSetDevice(0));
     initialize_spin_compiled(para);
   }
 }
@@ -144,7 +164,7 @@ static void __global__ find_max_min(
   }
 }
 
-template <int max_dim>
+template <int max_dim, bool WideSpin = false>
 static __global__ void apply_ann_one_layer_warp(
   const int N,
   const NEP_ANN annmb,
@@ -152,12 +172,15 @@ static __global__ void apply_ann_one_layer_warp(
   const float* __restrict__ g_descriptors,
   const float* __restrict__ g_q_scaler,
   double* g_pe,
-  float* g_Fp)
+  float* g_Fp,
+  int structural_dim,
+  const double* wide_spin_descriptors)
 {
   constexpr int warp_size = 32;
   constexpr int values_per_lane = (max_dim + warp_size - 1) / warp_size;
   const int lane = threadIdx.x & (warp_size - 1);
   const int atom = (blockIdx.x * blockDim.x + threadIdx.x) / warp_size;
+  const nep_spin::WarpMask mask = nep_spin::tile_mask(warp_size);
   if (atom >= N)
     return;
 
@@ -167,33 +190,37 @@ static __global__ void apply_ann_one_layer_warp(
   const float* w0 = annmb.wb[type];
   const float* b0 = w0 + num_neurons * dim;
   const float* w1 = b0 + num_neurons;
-  float q[values_per_lane] = {};
-  float Fp[values_per_lane] = {};
+  using Input = typename std::conditional<WideSpin, double, float>::type;
+  Input q[values_per_lane] = {};
+  double Fp[values_per_lane] = {};
   for (int k = 0; k < values_per_lane; ++k) {
     const int d = lane + k * warp_size;
     if (d < dim) {
-      q[k] = g_descriptors[atom + d * N] * g_q_scaler[d];
+      if (WideSpin && d >= structural_dim)
+        q[k] = wide_spin_descriptors[atom + (d - structural_dim) * N] * g_q_scaler[d];
+      else
+        q[k] = g_descriptors[atom + d * N] * g_q_scaler[d];
     }
   }
 
-  float energy = 0.0f;
+  double energy = 0.0f;
   for (int n = 0; n < num_neurons; ++n) {
-    float w0_times_q = 0.0f;
+    double w0_times_q = 0.0f;
     for (int k = 0; k < values_per_lane; ++k) {
       const int d = lane + k * warp_size;
       if (d < dim)
-        w0_times_q += w0[n * dim + d] * q[k];
+        w0_times_q += static_cast<double>(w0[n * dim + d]) * q[k];
     }
     for (int offset = warp_size / 2; offset > 0; offset /= 2) {
-      w0_times_q += __shfl_down_sync(gpuLaneMask(0xffffffff), w0_times_q, offset, warp_size);
+      w0_times_q += __shfl_down_sync(mask, w0_times_q, offset, warp_size);
     }
-    float derivative_scale = 0.0f;
+    double derivative_scale = 0.0f;
     if (lane == 0) {
-      const float x1 = tanh(w0_times_q - b0[n]);
+      const double x1 = tanh(w0_times_q - b0[n]);
       derivative_scale = w1[n] * (1.0f - x1 * x1);
       energy += w1[n] * x1;
     }
-    derivative_scale = __shfl_sync(gpuLaneMask(0xffffffff), derivative_scale, 0, warp_size);
+    derivative_scale = __shfl_sync(mask, derivative_scale, 0, warp_size);
     for (int k = 0; k < values_per_lane; ++k) {
       const int d = lane + k * warp_size;
       if (d < dim)
@@ -208,6 +235,13 @@ static __global__ void apply_ann_one_layer_warp(
     if (d < dim)
       g_Fp[atom + d * N] = Fp[k] * g_q_scaler[d];
   }
+}
+
+static __global__ void copy_spin_descriptors(int count, const double* spin, float* output)
+{
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < count)
+    output[index] = spin[index];
 }
 
 Spin_Data& NEP_Spin_Model::magnetic(Dataset& dataset)
@@ -243,6 +277,17 @@ void NEP_Spin_Model::find_force(
       compiled_kernel_.get());
 
     find_additional_descriptors(para, dataset[device_id], device_id);
+    const auto& wide = spin_data_[device_id].wide_spin_descriptors;
+    if (
+      wide.size() &&
+      (calculate_q_scaler || (para.prediction == 1 && para.output_descriptor >= 1))) {
+      const int count = dataset[device_id].N * para.dim_spin;
+      copy_spin_descriptors<<<(count + 127) / 128, 128>>>(
+        count,
+        wide.data(),
+        nep_data[device_id].descriptors.data() + size_t(struct_dim_) * dataset[device_id].N);
+      GPU_CHECK_KERNEL
+    }
     if (para.prediction == 1 && para.output_descriptor >= 1) {
       output_nep_descriptors(
         dataset[device_id],
@@ -269,7 +314,7 @@ void NEP_Spin_Model::find_force(
     initialize_additional_outputs(dataset[device_id], device_id);
     auto& data = dataset[device_id];
     auto& work = nep_data[device_id];
-    if (compiled_kernel_) {
+    if (compiled_kernel_ && !wide.size()) {
       compiled_kernel_->launch_ann(
         data.N,
         data.type.data(),
@@ -279,14 +324,29 @@ void NEP_Spin_Model::find_force(
         data.energy.data(),
         work.Fp.data());
     } else {
-      apply_ann_one_layer_warp<NEP_Spin_Model_File::MAX_DIM_SPIN><<<(data.N + 3) / 4, 128>>>(
-        data.N,
-        annmb[device_id],
-        data.type.data(),
-        work.descriptors.data(),
-        para.q_scaler_gpu[device_id].data(),
-        data.energy.data(),
-        work.Fp.data());
+      auto launch = [&](auto wide_input) {
+        auto launch_dim = [&](auto capacity) {
+          apply_ann_one_layer_warp<decltype(capacity)::value, decltype(wide_input)::value>
+            <<<(data.N + 3) / 4, 128>>>(
+              data.N,
+              annmb[device_id],
+              data.type.data(),
+              work.descriptors.data(),
+              para.q_scaler_gpu[device_id].data(),
+              data.energy.data(),
+              work.Fp.data(),
+              struct_dim_,
+              wide.size() ? wide.data() : nullptr);
+        };
+        if (annmb[device_id].dim <= NEP_Spin_Model_File::COMPACT_ANN_DIM)
+          launch_dim(std::integral_constant<int, NEP_Spin_Model_File::COMPACT_ANN_DIM>{});
+        else
+          launch_dim(std::integral_constant<int, NEP_Spin_Model_File::MAX_DIM_SPIN>{});
+      };
+      if (wide.size())
+        launch(std::true_type{});
+      else
+        launch(std::false_type{});
       GPU_CHECK_KERNEL
     }
     compute_nep_forces(
@@ -301,6 +361,18 @@ void NEP_Spin_Model::find_force(
       add_nep_zbl(zbl, dataset[device_id], neighbor[device_id]);
     }
     find_additional_force(para, dataset[device_id], device_id);
+    const auto& walls = spin_data_[device_id].spin_walls;
+    if (walls.size()) {
+      auto& spin = magnetic(data);
+      add_spin_wall<<<(data.N + 127) / 128, 128>>>(
+        data.N,
+        data.type.data(),
+        spin.spin.data(),
+        walls.data(),
+        data.energy.data(),
+        spin.mforce.data());
+      GPU_CHECK_KERNEL
+    }
   }
 }
 
@@ -317,7 +389,7 @@ int NEP_Spin_Model::prepare_data()
   int capacity = training->N;
   if (para.lambda_spin_response > 0 && !para.prediction) {
     std::vector<Structure> frames;
-    std::vector<Spin_Data::Labels> labels;
+    std::vector<Spin_Data::FrameInput> labels;
     reader.read_response(frames, labels);
     if (frames.empty())
       PRINT_INPUT_ERROR("response.xyz must not be empty.");
@@ -333,8 +405,11 @@ int NEP_Spin_Model::prepare_data()
   }
   initialize(para, capacity, training->device_count);
   if (!para.prediction) {
-    energy_loss.initialize(para);
     const int size = (para.num_types + 1) * para.population_size;
+    fitness_energy.resize(size);
+    fitness_force.resize(size);
+    fitness_virial.resize(size);
+    fitness_ediff.resize(para.population_size);
     fitness_mforce.assign(size, 0.0f);
     fitness_tau.assign(size, 0.0f);
     fitness_response.assign(size, 0.0f);
@@ -377,22 +452,8 @@ void NEP_Spin_Model::parameter_groups(std::vector<int>& groups)
 {
   auto& para = *model_parameters;
   find_nep_type_of_variable(para, groups, 1, 1);
-  const int offset = para.number_of_variables - para.number_of_variables_descriptor_spin -
-                     para.number_of_variables_spin_projection;
-  for (int channel = 0; channel < para.spin_compress; ++channel) {
-    for (int basis = 0; basis <= para.spin_basis_size[0]; ++basis) {
-      for (int t1 = 0; t1 < para.num_types; ++t1) {
-        for (int t2 = 0; t2 < para.num_types; ++t2) {
-          const int pair = t1 * para.num_types + t2;
-          const int coefficient =
-            (channel * (para.spin_basis_size[0] + 1) + basis) * para.num_types * para.num_types +
-            pair;
-          groups[offset + coefficient] = t1;
-        }
-      }
-    }
-  }
 }
+
 void NEP_Spin_Model::read_model(float* parameters)
 {
   read_spin_model(*model_parameters, parameters);
@@ -419,8 +480,14 @@ void NEP_Spin_Model::evaluate(int batch, const float* population)
     const float* parameters = population + first * para.number_of_variables;
     find_force(para, parameters, training->train_set[batch], false, count);
     for (int device = 0; device < count; ++device) {
+      const int candidate = first + device;
       Dataset& data = training->train_set[batch][device];
-      energy_loss.evaluate(para, data, energy_difference, batch, first + device, device);
+      double energy_shift;
+      const auto energy_rmse = data.get_rmse_energy(para, energy_shift, true, true, device);
+      const auto force_rmse = data.get_rmse_force(para, true, device);
+      const auto virial_rmse = magnetic(data).get_rmse_virial(para, data, true, device);
+      fitness_ediff[candidate] =
+        para.lambda_d * energy_difference.get_rmse_train(data, batch, device);
       auto m = para.split_mforce_loss
                  ? magnetic(data).get_rmse_mforce_parallel(para, data, true, device)
                  : magnetic(data).get_rmse_mforce(para, data, true, device);
@@ -429,7 +496,10 @@ void NEP_Spin_Model::evaluate(int batch, const float* population)
         perpendicular = magnetic(data).get_rmse_mforce_perp(para, data, true, device);
       auto t = magnetic(data).get_rmse_tau(para, data, true, device);
       for (int type = 0; type <= para.num_types; ++type) {
-        const int index = first + device + type * para.population_size;
+        const int index = candidate + type * para.population_size;
+        fitness_energy[index] = para.lambda_e * energy_rmse[type];
+        fitness_force[index] = para.lambda_f * force_rmse[type];
+        fitness_virial[index] = para.lambda_v * virial_rmse[type];
         fitness_mforce[index] = para.split_mforce_loss ? para.lambda_m_parallel * m[type] +
                                                            para.lambda_m_perp * perpendicular[type]
                                                        : para.lambda_m * m[type];
@@ -449,10 +519,15 @@ void NEP_Spin_Model::evaluate(int batch, const float* population)
 void NEP_Spin_Model::accumulate_fitness(float* total)
 {
   auto& para = *model_parameters;
-  energy_loss.accumulate_fitness(para, total);
-  for (int i = 0; i < fitness_mforce.size(); ++i)
-    total[i] = total[i] + fitness_mforce[i] + fitness_tau[i] + fitness_response[i];
-  energy_loss.accumulate_energy_difference(para, total);
+  for (int type = 0; type <= para.num_types; ++type) {
+    for (int candidate = 0; candidate < para.population_size; ++candidate) {
+      const int index = candidate + type * para.population_size;
+      // Keep the existing accumulation order for SNES candidate ranking.
+      total[index] = total[index] + fitness_energy[index] + fitness_force[index] +
+                     fitness_virial[index] + fitness_mforce[index] + fitness_tau[index] +
+                     fitness_response[index] + fitness_ediff[candidate];
+    }
+  }
 }
 void NEP_Spin_Model::print_training_header()
 {
@@ -476,6 +551,41 @@ void NEP_Spin_Model::print_training_header()
     printf(" M-parallel-Train M-perp-Train M-parallel-Test M-perp-Test");
   printf("\n");
 }
+
+static void
+write_spin_virial(FILE* file, const Dataset& data, int nc, const Spin_Data::Labels& label)
+{
+  const int start = data.Na_sum_cpu[nc];
+  const int count = data.Na_cpu[nc];
+  const double missing = -1e6;
+  double predicted[9] = {};
+  double reference[9] = {};
+  for (int d = 0; d < 9; ++d) {
+    for (int a = start; a < start + count; ++a)
+      predicted[d] += data.virial_cpu[d * data.N + a];
+    predicted[d] /= count;
+  }
+  for (int d = 0; d < 6; ++d)
+    reference[d] = data.virial_ref_cpu[d * data.Nc + nc];
+  std::copy(label.antisymmetric_virial.begin(), label.antisymmetric_virial.end(), reference + 6);
+
+  for (bool is_reference : {false, true}) {
+    const double* v = is_reference ? reference : predicted;
+    // Reconstruct the Cartesian rows from the symmetric and antisymmetric parts.
+    const double tensor[3][3] = {
+      {v[0], v[3] + v[6], v[5] - v[8]},
+      {v[3] - v[6], v[1], v[4] + v[7]},
+      {v[5] + v[8], v[4] - v[7], v[2]}};
+    const bool missing_reference = is_reference && !data.structures[nc].has_virial;
+    for (int row = 0; row < 3; ++row) {
+      for (int col = 0; col < 3; ++col) {
+        const char separator = is_reference && row == 2 && col == 2 ? '\n' : ' ';
+        fprintf(file, "%.9g%c", missing_reference ? missing : tensor[row][col], separator);
+      }
+    }
+  }
+}
+
 void NEP_Spin_Model::write_magnetic_predictions(
   const char* prefix, const std::vector<std::pair<Dataset*, int>>& structures)
 {
@@ -502,12 +612,55 @@ void NEP_Spin_Model::write_magnetic_predictions(
   }
   fclose(file);
 }
+
+void NEP_Spin_Model::write_predictions(
+  const char* prefix, const std::vector<std::pair<Dataset*, int>>& structures)
+{
+  const std::string suffix = std::string("_") + prefix + ".out";
+  FILE* energy = my_fopen(("energy" + suffix).c_str(), "w");
+  FILE* force = my_fopen(("force" + suffix).c_str(), "w");
+  FILE* virial = my_fopen(("virial" + suffix).c_str(), "w");
+  FILE* stress = my_fopen(("stress" + suffix).c_str(), "w");
+  for (const auto& entry : structures) {
+    auto& data = *entry.first;
+    const int nc = entry.second;
+    const int start = data.Na_sum_cpu[nc];
+    const int count = data.Na_cpu[nc];
+    double total_energy = 0.0;
+    for (int atom = start; atom < start + count; ++atom)
+      total_energy += data.energy_cpu[atom];
+    fprintf(energy, "%.17g %.17g\n", total_energy / count, data.energy_ref_cpu[nc]);
+    write_nep_atomic_predictions(
+      3, force, data.force_cpu.data(), data.force_ref_cpu.data(), data, nc);
+    write_spin_virial(virial, data, nc, magnetic(data).labels[nc]);
+    write_nep_structure_predictions(
+      true, 6, stress, data.virial_cpu.data(), data.virial_ref_cpu.data(), data, nc);
+  }
+  for (FILE* file : {energy, force, virial, stress})
+    fclose(file);
+  write_magnetic_predictions(prefix, structures);
+}
+
+NEP_Energy_Error NEP_Spin_Model::get_energy_error(Dataset& data, bool is_train, int batch)
+{
+  auto& para = *model_parameters;
+  NEP_Energy_Error error;
+  error.energy = data.get_rmse_energy(para, error.energy_shift, false, is_train, 0).back();
+  error.force = data.get_rmse_force(para, false, 0).back();
+  error.virial = magnetic(data).get_rmse_virial(para, data, false, 0).back();
+  if (para.has_ediff_combinations) {
+    error.ediff = is_train ? energy_difference.get_rmse_train(data, batch, 0)
+                           : energy_difference.get_rmse_test(data, 0);
+  }
+  return error;
+}
+
 void NEP_Spin_Model::report_error(const TrainingReport& report)
 {
   auto& para = *model_parameters;
   find_force(para, report.parameters, training->train_set[report.batch], false, 1);
   Dataset& data = training->train_set[report.batch][0];
-  auto train = energy_loss.get_error(para, data, energy_difference, true, report.batch);
+  auto train = get_energy_error(data, true, report.batch);
   const float mt = magnetic(data).get_rmse_mforce(para, data, false, 0).back();
   const float tt = magnetic(data).get_rmse_tau(para, data, false, 0).back();
   float mp_train = 0, mt_train = 0, mp_test = 0, mt_test = 0;
@@ -521,7 +674,7 @@ void NEP_Spin_Model::report_error(const TrainingReport& report)
   if (training->has_test_set) {
     find_force(para, report.parameters, training->test_set, false, 1);
     Dataset& data = training->test_set[0];
-    test = energy_loss.get_error(para, data, energy_difference, false, 0);
+    test = get_energy_error(data, false, 0);
     mv = magnetic(data).get_rmse_mforce(para, data, false, 0).back();
     tv = magnetic(data).get_rmse_tau(para, data, false, 0).back();
     if (para.split_mforce_loss) {
@@ -566,7 +719,7 @@ void NEP_Spin_Model::report_error(const TrainingReport& report)
       mv,
       tv);
     if (para.split_mforce_loss)
-      fprintf(file, " %.8e %.8e %.8e %.8e", mp_train, mt_train, mp_test, mt_test);
+      fprintf(file, " %.5f %.5f %.5f %.5f", mp_train, mt_train, mp_test, mt_test);
     if (para.has_ediff_combinations)
       fprintf(file, " %.5f %.5f", train.ediff, test.ediff);
     fprintf(file, "\n");
@@ -579,8 +732,7 @@ void NEP_Spin_Model::report_error(const TrainingReport& report)
     std::vector<std::pair<Dataset*, int>> structures;
     for (int nc = 0; nc < data.Nc; ++nc)
       structures.emplace_back(&data, nc);
-    write_nep_energy_predictions("test", structures);
-    write_magnetic_predictions("test", structures);
+    write_predictions("test", structures);
   }
 }
 void NEP_Spin_Model::predict(float* parameters)
@@ -594,6 +746,5 @@ void NEP_Spin_Model::predict(float* parameters)
   }
   std::vector<std::pair<Dataset*, int>> structures;
   training->get_prediction_order(structures);
-  write_nep_energy_predictions("train", structures);
-  write_magnetic_predictions("train", structures);
+  write_predictions("train", structures);
 }

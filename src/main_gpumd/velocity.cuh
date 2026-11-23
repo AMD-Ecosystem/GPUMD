@@ -18,6 +18,7 @@
 #include "utilities/gpu_vector.cuh"
 #include <vector>
 
+class Atom;
 class Group;
 
 class Velocity
@@ -39,6 +40,9 @@ public:
   void finalize();
 
 private:
+  GPU_Vector<double> correction_sums;
+  GPU_Vector<double> correction_parameters;
+
   void correct_velocity(
     const int N,
     const std::vector<double>& cpu_mass,

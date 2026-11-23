@@ -21,23 +21,32 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
 
 This is the multi-GPU (single-node) version. It has good parallel efficiency
 when there is NVlink, but is also not very bad when there is only PCI-E.
+
+Major contributors:
+  Zheyong Fan: Initial implementation.
+  Jiahui Liu: Short-range ZBL repulsion.
+  Jiuyang Shi: Temperature-dependent NEP models.
+  Bohan Zhang: Multi-GPU synchronization fix on AMD GPUs.
+  Zaixu Duan: Additional four-body NEP descriptors.
+  Yixin Deng: Fixed integer overflow in large-system array indexing.
+  Erik Fransson: Increased NEP descriptor limits.
 ------------------------------------------------------------------------------*/
 
 #include "nep_multigpu.cuh"
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
-#include "utilities/nep_io/nep_model_file.cuh"
 #include "utilities/gpu_macro.cuh"
+#include "utilities/nep_io/nep_model_file.cuh"
 #include "utilities/nep_utilities.cuh"
 #include "utilities/run_input.cuh"
 #include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
 #include <vector>
-#include <cstring>
 
 const std::string ELEMENTS[NUM_ELEMENTS] = {
   "H",  "He", "Li", "Be", "B",  "C",  "N",  "O",  "F",  "Ne", "Na", "Mg", "Al", "Si", "P",  "S",
@@ -110,7 +119,8 @@ NEP_MULTIGPU::NEP_MULTIGPU(
     if (zbl.flexible) {
       printf("    has the flexible ZBL potential\n");
     } else if (paramb.use_typewise_cutoff_zbl) {
-      printf("    has the universal ZBL with typewise cutoff with a factor of %g.\n",
+      printf(
+        "    has the universal ZBL with typewise cutoff with a factor of %g.\n",
         paramb.typewise_cutoff_zbl_factor);
     } else {
       printf(
@@ -254,11 +264,13 @@ void NEP_MULTIGPU::allocate_memory()
     nep_data[gpu].f12y.resize(nep_temp_data.num_atoms_per_gpu * paramb.MN_angular);
     nep_data[gpu].f12z.resize(nep_temp_data.num_atoms_per_gpu * paramb.MN_angular);
     nep_data[gpu].NN_radial.resize(nep_temp_data.num_atoms_per_gpu);
-    nep_data[gpu].NL_radial.resize(static_cast<size_t>(nep_temp_data.num_atoms_per_gpu) * paramb.MN_radial);
+    nep_data[gpu].NL_radial.resize(
+      static_cast<size_t>(nep_temp_data.num_atoms_per_gpu) * paramb.MN_radial);
     nep_data[gpu].NN_angular.resize(nep_temp_data.num_atoms_per_gpu);
     nep_data[gpu].NL_angular.resize(nep_temp_data.num_atoms_per_gpu * paramb.MN_angular);
     nep_data[gpu].Fp.resize(static_cast<size_t>(nep_temp_data.num_atoms_per_gpu) * annmb[gpu].dim);
-    nep_data[gpu].sum_fxyz.resize(static_cast<size_t>(nep_temp_data.num_atoms_per_gpu) * (paramb.n_max_angular + 1) *
+    nep_data[gpu].sum_fxyz.resize(
+      static_cast<size_t>(nep_temp_data.num_atoms_per_gpu) * (paramb.n_max_angular + 1) *
       ((paramb.L_max + 1) * (paramb.L_max + 1) - 1));
     nep_data[gpu].type.resize(nep_temp_data.num_atoms_per_gpu);
     nep_data[gpu].position.resize(nep_temp_data.num_atoms_per_gpu * 3);
@@ -303,9 +315,9 @@ void NEP_MULTIGPU::update_potential(float* parameters, ANN& ann)
 static __device__ void find_cell_id(
   const int partition_direction,
   const Box& box,
-  const double x,
-  const double y,
-  const double z,
+  const float x,
+  const float y,
+  const float z,
   const double rc_inv,
   const int nx,
   const int ny,
@@ -346,9 +358,9 @@ static __device__ void find_cell_id(
 static __device__ void find_cell_id(
   const int partition_direction,
   const Box& box,
-  const double x,
-  const double y,
-  const double z,
+  const float x,
+  const float y,
+  const float z,
   const double rc_inv,
   const int nx,
   const int ny,
@@ -372,14 +384,15 @@ static __device__ void find_cell_id(
     cell_id);
 }
 
+template <typename T>
 static __global__ void find_cell_counts(
   const int partition_direction,
   const Box box,
   const int N,
   int* cell_count,
-  const double* x,
-  const double* y,
-  const double* z,
+  const T* x,
+  const T* y,
+  const T* z,
   const int nx,
   const int ny,
   const int nz,
@@ -393,6 +406,7 @@ static __global__ void find_cell_counts(
   }
 }
 
+template <typename T>
 static __global__ void find_cell_contents(
   const int partition_direction,
   const Box box,
@@ -400,9 +414,9 @@ static __global__ void find_cell_contents(
   int* cell_count,
   const int* cell_count_sum,
   int* cell_contents,
-  const double* x,
-  const double* y,
-  const double* z,
+  const T* x,
+  const T* y,
+  const T* z,
   const int nx,
   const int ny,
   const int nz,
@@ -425,6 +439,7 @@ static void __global__ set_to_zero(int size, int* data)
   }
 }
 
+template <typename T>
 static void find_cell_list(
   gpuStream_t& stream,
   const int partition_direction,
@@ -432,7 +447,7 @@ static void find_cell_list(
   const int* num_bins,
   Box& box,
   const int N,
-  const GPU_Vector<double>& position_per_atom,
+  const GPU_Vector<T>& position_per_atom,
   GPU_Vector<int>& cell_count,
   GPU_Vector<int>& cell_count_sum,
   GPU_Vector<int>& cell_contents)
@@ -441,9 +456,9 @@ static void find_cell_list(
   const int block_size = 256;
   const int grid_size = (N - 1) / block_size + 1;
   const double rc_inv = 1.0 / rc;
-  const double* x = position_per_atom.data();
-  const double* y = position_per_atom.data() + offset;
-  const double* z = position_per_atom.data() + offset * 2;
+  const T* x = position_per_atom.data();
+  const T* y = position_per_atom.data() + offset;
+  const T* z = position_per_atom.data() + offset * 2;
   const int N_cells = num_bins[0] * num_bins[1] * num_bins[2];
 
   // number of cells is allowed to be larger than the number of atoms
@@ -464,7 +479,7 @@ static void find_cell_list(
     cell_contents.size(), cell_contents.data());
   GPU_CHECK_KERNEL
 
-  find_cell_counts<<<grid_size, block_size, 0, stream>>>(
+  find_cell_counts<T><<<grid_size, block_size, 0, stream>>>(
     partition_direction,
     box,
     N,
@@ -492,7 +507,7 @@ static void find_cell_list(
     cell_count.size(), cell_count.data());
   GPU_CHECK_KERNEL
 
-  find_cell_contents<<<grid_size, block_size, 0, stream>>>(
+  find_cell_contents<T><<<grid_size, block_size, 0, stream>>>(
     partition_direction,
     box,
     N,
@@ -512,6 +527,7 @@ static void find_cell_list(
 static __global__ void find_neighbor_list_large_box(
   NEP_MULTIGPU::ParaMB paramb,
   const int partition_direction,
+  const double rc_inv_cell_list,
   const int N,
   const int N1,
   const int N2,
@@ -523,9 +539,9 @@ static __global__ void find_neighbor_list_large_box(
   const int* __restrict__ g_cell_count,
   const int* __restrict__ g_cell_count_sum,
   const int* __restrict__ g_cell_contents,
-  const double* __restrict__ g_x,
-  const double* __restrict__ g_y,
-  const double* __restrict__ g_z,
+  const float* __restrict__ g_x,
+  const float* __restrict__ g_y,
+  const float* __restrict__ g_z,
   int* g_NN_radial,
   int* g_NL_radial,
   int* g_NN_angular,
@@ -536,9 +552,9 @@ static __global__ void find_neighbor_list_large_box(
     return;
   }
 
-  double x1 = g_x[n1];
-  double y1 = g_y[n1];
-  double z1 = g_z[n1];
+  float x1 = g_x[n1];
+  float y1 = g_y[n1];
+  float z1 = g_z[n1];
   int t1 = g_type[n1];
   int count_radial = 0;
   int count_angular = 0;
@@ -553,7 +569,7 @@ static __global__ void find_neighbor_list_large_box(
     x1,
     y1,
     z1,
-    2.0f * paramb.rc_radial_max_inv,
+    rc_inv_cell_list,
     nx,
     ny,
     nz,
@@ -604,11 +620,10 @@ static __global__ void find_neighbor_list_large_box(
             continue;
           }
 
-          double x12double = g_x[n2] - x1;
-          double y12double = g_y[n2] - y1;
-          double z12double = g_z[n2] - z1;
-          apply_mic(box, x12double, y12double, z12double);
-          float x12 = float(x12double), y12 = float(y12double), z12 = float(z12double);
+          float x12 = g_x[n2] - x1;
+          float y12 = g_y[n2] - y1;
+          float z12 = g_z[n2] - z1;
+          apply_mic(box, x12, y12, z12);
           float d12_square = x12 * x12 + y12 * y12 + z12 * z12;
 
           int t2 = g_type[n2];
@@ -645,9 +660,9 @@ static __global__ void find_descriptor(
   const int* g_NN_angular,
   const int* g_NL_angular,
   const int* __restrict__ g_type,
-  const double* __restrict__ g_x,
-  const double* __restrict__ g_y,
-  const double* __restrict__ g_z,
+  const float* __restrict__ g_x,
+  const float* __restrict__ g_y,
+  const float* __restrict__ g_z,
   double* g_pe,
   float* g_Fp,
   double* g_virial,
@@ -656,19 +671,18 @@ static __global__ void find_descriptor(
   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 < N2) {
     int t1 = g_type[n1];
-    double x1 = g_x[n1];
-    double y1 = g_y[n1];
-    double z1 = g_z[n1];
+    float x1 = g_x[n1];
+    float y1 = g_y[n1];
+    float z1 = g_z[n1];
     float q[MAX_DIM] = {0.0f};
 
     // get radial descriptors
     for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
       int n2 = g_NL[static_cast<size_t>(N) * i1 + n1];
-      double x12double = g_x[n2] - x1;
-      double y12double = g_y[n2] - y1;
-      double z12double = g_z[n2] - z1;
-      apply_mic(box, x12double, y12double, z12double);
-      float x12 = float(x12double), y12 = float(y12double), z12 = float(z12double);
+      float x12 = g_x[n2] - x1;
+      float y12 = g_y[n2] - y1;
+      float z12 = g_z[n2] - z1;
+      apply_mic(box, x12, y12, z12);
       float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
       float fc12;
       int t2 = g_type[n2];
@@ -693,11 +707,10 @@ static __global__ void find_descriptor(
       float s[NUM_OF_ABC] = {0.0f};
       for (int i1 = 0; i1 < g_NN_angular[n1]; ++i1) {
         int n2 = g_NL_angular[n1 + N * i1];
-        double x12double = g_x[n2] - x1;
-        double y12double = g_y[n2] - y1;
-        double z12double = g_z[n2] - z1;
-        apply_mic(box, x12double, y12double, z12double);
-        float x12 = float(x12double), y12 = float(y12double), z12 = float(z12double);
+        float x12 = g_x[n2] - x1;
+        float y12 = g_y[n2] - y1;
+        float z12 = g_z[n2] - z1;
+        apply_mic(box, x12, y12, z12);
         float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
         float fc12;
         int t2 = g_type[n2];
@@ -719,10 +732,22 @@ static __global__ void find_descriptor(
         }
         accumulate_s(paramb.L_max, d12, x12, y12, z12, gn12, s);
       }
-      find_q(paramb.L_max, paramb.has_q_222, paramb.has_q_1111, paramb.has_q_112, paramb.has_q_123, paramb.has_q_233, paramb.has_q_134,
-        paramb.n_max_angular + 1, n, s, q + (paramb.n_max_radial + 1));
+      find_q(
+        paramb.L_max,
+        paramb.has_q_222,
+        paramb.has_q_1111,
+        paramb.has_q_112,
+        paramb.has_q_123,
+        paramb.has_q_233,
+        paramb.has_q_134,
+        paramb.n_max_angular + 1,
+        n,
+        s,
+        q + (paramb.n_max_radial + 1));
       for (int abc = 0; abc < (paramb.L_max + 1) * (paramb.L_max + 1) - 1; ++abc) {
-        g_sum_fxyz[static_cast<size_t>(N) * (n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) + n1] = s[abc];
+        g_sum_fxyz
+          [static_cast<size_t>(N) * (n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) +
+           n1] = s[abc];
       }
     }
 
@@ -735,15 +760,7 @@ static __global__ void find_descriptor(
     float F = 0.0f, Fp[MAX_DIM] = {0.0f};
 
     apply_ann_one_layer(
-      annmb.dim,
-      annmb.num_neurons1,
-      annmb.w0[t1],
-      annmb.b0[t1],
-      annmb.w1[t1],
-      annmb.b1,
-      q,
-      F,
-      Fp);
+      annmb.dim, annmb.num_neurons1, annmb.w0[t1], annmb.b0[t1], annmb.w1[t1], annmb.b1, q, F, Fp);
 
     g_pe[n1] = double(F) + annmb.energy_reference[t1];
 
@@ -763,9 +780,9 @@ static __global__ void find_force_radial(
   const int* g_NN,
   const int* g_NL,
   const int* __restrict__ g_type,
-  const double* __restrict__ g_x,
-  const double* __restrict__ g_y,
-  const double* __restrict__ g_z,
+  const float* __restrict__ g_x,
+  const float* __restrict__ g_y,
+  const float* __restrict__ g_z,
   const float* __restrict__ g_Fp,
   double* g_fx,
   double* g_fy,
@@ -787,17 +804,17 @@ static __global__ void find_force_radial(
     float s_szx = 0.0f;
     float s_szy = 0.0f;
     float s_szz = 0.0f;
-    double x1 = g_x[n1];
-    double y1 = g_y[n1];
-    double z1 = g_z[n1];
+    float x1 = g_x[n1];
+    float y1 = g_y[n1];
+    float z1 = g_z[n1];
     for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
       int n2 = g_NL[static_cast<size_t>(N) * i1 + n1];
       int t2 = g_type[n2];
-      double x12double = g_x[n2] - x1;
-      double y12double = g_y[n2] - y1;
-      double z12double = g_z[n2] - z1;
-      apply_mic(box, x12double, y12double, z12double);
-      float r12[3] = {float(x12double), float(y12double), float(z12double)};
+      float x12 = g_x[n2] - x1;
+      float y12 = g_y[n2] - y1;
+      float z12 = g_z[n2] - z1;
+      apply_mic(box, x12, y12, z12);
+      float r12[3] = {x12, y12, z12};
       float d12 = sqrt(r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2]);
       float d12inv = 1.0f / d12;
       float f12[3] = {0.0f};
@@ -869,9 +886,9 @@ static __global__ void find_partial_force_angular(
   const int* g_NN_angular,
   const int* g_NL_angular,
   const int* __restrict__ g_type,
-  const double* __restrict__ g_x,
-  const double* __restrict__ g_y,
-  const double* __restrict__ g_z,
+  const float* __restrict__ g_x,
+  const float* __restrict__ g_y,
+  const float* __restrict__ g_z,
   const float* __restrict__ g_Fp,
   const float* __restrict__ g_sum_fxyz,
   float* g_f12x,
@@ -888,23 +905,23 @@ static __global__ void find_partial_force_angular(
     }
     for (int n = 0; n < paramb.n_max_angular + 1; ++n) {
       for (int abc = 0; abc < (paramb.L_max + 1) * (paramb.L_max + 1) - 1; ++abc) {
-        sum_fxyz[n * NUM_OF_ABC + abc] = 
-          g_sum_fxyz[static_cast<size_t>(N) * (n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) + n1];
+        sum_fxyz[n * NUM_OF_ABC + abc] = g_sum_fxyz
+          [static_cast<size_t>(N) * (n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) + n1];
       }
     }
 
     int t1 = g_type[n1];
-    double x1 = g_x[n1];
-    double y1 = g_y[n1];
-    double z1 = g_z[n1];
+    float x1 = g_x[n1];
+    float y1 = g_y[n1];
+    float z1 = g_z[n1];
     for (int i1 = 0; i1 < g_NN_angular[n1]; ++i1) {
       int index = i1 * N + n1;
       int n2 = g_NL_angular[n1 + N * i1];
-      double x12double = g_x[n2] - x1;
-      double y12double = g_y[n2] - y1;
-      double z12double = g_z[n2] - z1;
-      apply_mic(box, x12double, y12double, z12double);
-      float r12[3] = {float(x12double), float(y12double), float(z12double)};
+      float x12 = g_x[n2] - x1;
+      float y12 = g_y[n2] - y1;
+      float z12 = g_z[n2] - z1;
+      apply_mic(box, x12, y12, z12);
+      float r12[3] = {x12, y12, z12};
       float d12 = sqrt(r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2]);
       float f12[3] = {0.0f};
       float fc12, fcp12;
@@ -930,8 +947,24 @@ static __global__ void find_partial_force_angular(
           gn12 += fn12[k] * annmb.c_type_pair[c_index];
           gnp12 += fnp12[k] * annmb.c_type_pair[c_index];
         }
-        accumulate_f12(paramb.L_max, paramb.has_q_222, paramb.has_q_1111, paramb.has_q_112, paramb.has_q_123, paramb.has_q_233, paramb.has_q_134,
-          paramb.num_L, n, paramb.n_max_angular + 1, d12, r12, gn12, gnp12, Fp, sum_fxyz, f12);
+        accumulate_f12(
+          paramb.L_max,
+          paramb.has_q_222,
+          paramb.has_q_1111,
+          paramb.has_q_112,
+          paramb.has_q_123,
+          paramb.has_q_233,
+          paramb.has_q_134,
+          paramb.num_L,
+          n,
+          paramb.n_max_angular + 1,
+          d12,
+          r12,
+          gn12,
+          gnp12,
+          Fp,
+          sum_fxyz,
+          f12);
       }
       g_f12x[index] = f12[0];
       g_f12y[index] = f12[1];
@@ -950,9 +983,9 @@ static __global__ void find_force_ZBL(
   const int* g_NN,
   const int* g_NL,
   const int* __restrict__ g_type,
-  const double* __restrict__ g_x,
-  const double* __restrict__ g_y,
-  const double* __restrict__ g_z,
+  const float* __restrict__ g_x,
+  const float* __restrict__ g_y,
+  const float* __restrict__ g_z,
   double* g_fx,
   double* g_fy,
   double* g_fz,
@@ -974,19 +1007,19 @@ static __global__ void find_force_ZBL(
     float s_szx = 0.0f;
     float s_szy = 0.0f;
     float s_szz = 0.0f;
-    double x1 = g_x[n1];
-    double y1 = g_y[n1];
-    double z1 = g_z[n1];
+    float x1 = g_x[n1];
+    float y1 = g_y[n1];
+    float z1 = g_z[n1];
     int type1 = g_type[n1];
     int zi = zbl.atomic_numbers[type1];
     float pow_zi = pow(float(zi), 0.23f);
     for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
       int n2 = g_NL[n1 + N * i1];
-      double x12double = g_x[n2] - x1;
-      double y12double = g_y[n2] - y1;
-      double z12double = g_z[n2] - z1;
-      apply_mic(box, x12double, y12double, z12double);
-      float r12[3] = {float(x12double), float(y12double), float(z12double)};
+      float x12 = g_x[n2] - x1;
+      float y12 = g_y[n2] - y1;
+      float z12 = g_z[n2] - z1;
+      apply_mic(box, x12, y12, z12);
+      float r12[3] = {x12, y12, z12};
       float d12 = sqrt(r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2]);
       float d12inv = 1.0f / d12;
       float f, fp;
@@ -1067,7 +1100,7 @@ static __global__ void distribute_position(
   const int* g_type_global,
   const double* g_position_global,
   int* g_type_local,
-  double* g_position_local)
+  float* g_position_local)
 {
   int n_local = blockIdx.x * blockDim.x + threadIdx.x;
   if (n_local < N3) {
@@ -1083,7 +1116,7 @@ static __global__ void distribute_position(
     g_type_local[n_local] = g_type_global[n_global];
     for (int d = 0; d < 3; ++d) {
       g_position_local[n_local + d * num_atoms_local] =
-        g_position_global[n_global + d * num_atoms_gobal];
+        static_cast<float>(g_position_global[n_global + d * num_atoms_gobal]);
     }
   }
 }
@@ -1127,9 +1160,9 @@ static __global__ void gpu_find_force_many_body(
   const float* __restrict__ g_f12x,
   const float* __restrict__ g_f12y,
   const float* __restrict__ g_f12z,
-  const double* __restrict__ g_x,
-  const double* __restrict__ g_y,
-  const double* __restrict__ g_z,
+  const float* __restrict__ g_x,
+  const float* __restrict__ g_y,
+  const float* __restrict__ g_z,
   double* g_fx,
   double* g_fy,
   double* g_fz,
@@ -1151,22 +1184,19 @@ static __global__ void gpu_find_force_many_body(
 
   if (n1 >= N1 && n1 < N2) {
     int neighbor_number = g_neighbor_number[n1];
-    double x1 = g_x[n1];
-    double y1 = g_y[n1];
-    double z1 = g_z[n1];
+    float x1 = g_x[n1];
+    float y1 = g_y[n1];
+    float z1 = g_z[n1];
 
     for (int i1 = 0; i1 < neighbor_number; ++i1) {
       int index = i1 * number_of_particles + n1;
       int n2 = g_neighbor_list[index];
       int neighbor_number_2 = g_neighbor_number[n2];
 
-      double x12double = g_x[n2] - x1;
-      double y12double = g_y[n2] - y1;
-      double z12double = g_z[n2] - z1;
-      apply_mic(box, x12double, y12double, z12double);
-      float x12 = float(x12double);
-      float y12 = float(y12double);
-      float z12 = float(z12double);
+      float x12 = g_x[n2] - x1;
+      float y12 = g_y[n2] - y1;
+      float z12 = g_z[n2] - z1;
+      apply_mic(box, x12, y12, z12);
 
       float f12x = g_f12x[index];
       float f12y = g_f12y[index];
@@ -1384,7 +1414,7 @@ void NEP_MULTIGPU::compute(
       CHECK(gpuMemcpy(
         nep_data[gpu].position.data() + nep_temp_data.num_atoms_per_gpu * d,
         nep_temp_data.position.data() + nep_temp_data.num_atoms_per_gpu * d,
-        sizeof(double) * nep_data[gpu].N3,
+        sizeof(float) * nep_data[gpu].N3,
         gpuMemcpyDeviceToDevice));
     }
   }
@@ -1415,6 +1445,7 @@ void NEP_MULTIGPU::compute(
       nep_data[gpu].stream>>>(
       paramb,
       partition_direction,
+      1.0 / rc_cell_list,
       nep_temp_data.num_atoms_per_gpu,
       nep_data[gpu].N4,
       nep_data[gpu].N5,
@@ -1623,9 +1654,9 @@ static __global__ void find_descriptor(
   const int* g_NN_angular,
   const int* g_NL_angular,
   const int* __restrict__ g_type,
-  const double* __restrict__ g_x,
-  const double* __restrict__ g_y,
-  const double* __restrict__ g_z,
+  const float* __restrict__ g_x,
+  const float* __restrict__ g_y,
+  const float* __restrict__ g_z,
   double* g_pe,
   float* g_Fp,
   double* g_virial,
@@ -1634,19 +1665,18 @@ static __global__ void find_descriptor(
   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 < N2) {
     int t1 = g_type[n1];
-    double x1 = g_x[n1];
-    double y1 = g_y[n1];
-    double z1 = g_z[n1];
+    float x1 = g_x[n1];
+    float y1 = g_y[n1];
+    float z1 = g_z[n1];
     float q[MAX_DIM] = {0.0f};
 
     // get radial descriptors
     for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
       int n2 = g_NL[static_cast<size_t>(N) * i1 + n1];
-      double x12double = g_x[n2] - x1;
-      double y12double = g_y[n2] - y1;
-      double z12double = g_z[n2] - z1;
-      apply_mic(box, x12double, y12double, z12double);
-      float x12 = float(x12double), y12 = float(y12double), z12 = float(z12double);
+      float x12 = g_x[n2] - x1;
+      float y12 = g_y[n2] - y1;
+      float z12 = g_z[n2] - z1;
+      apply_mic(box, x12, y12, z12);
       float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
       float fc12;
       int t2 = g_type[n2];
@@ -1671,11 +1701,10 @@ static __global__ void find_descriptor(
       float s[NUM_OF_ABC] = {0.0f};
       for (int i1 = 0; i1 < g_NN_angular[n1]; ++i1) {
         int n2 = g_NL_angular[n1 + N * i1];
-        double x12double = g_x[n2] - x1;
-        double y12double = g_y[n2] - y1;
-        double z12double = g_z[n2] - z1;
-        apply_mic(box, x12double, y12double, z12double);
-        float x12 = float(x12double), y12 = float(y12double), z12 = float(z12double);
+        float x12 = g_x[n2] - x1;
+        float y12 = g_y[n2] - y1;
+        float z12 = g_z[n2] - z1;
+        apply_mic(box, x12, y12, z12);
         float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
         float fc12;
         int t2 = g_type[n2];
@@ -1697,10 +1726,22 @@ static __global__ void find_descriptor(
         }
         accumulate_s(paramb.L_max, d12, x12, y12, z12, gn12, s);
       }
-      find_q(paramb.L_max, paramb.has_q_222, paramb.has_q_1111, paramb.has_q_112, paramb.has_q_123, paramb.has_q_233, paramb.has_q_134,
-        paramb.n_max_angular + 1, n, s, q + (paramb.n_max_radial + 1));
+      find_q(
+        paramb.L_max,
+        paramb.has_q_222,
+        paramb.has_q_1111,
+        paramb.has_q_112,
+        paramb.has_q_123,
+        paramb.has_q_233,
+        paramb.has_q_134,
+        paramb.n_max_angular + 1,
+        n,
+        s,
+        q + (paramb.n_max_radial + 1));
       for (int abc = 0; abc < (paramb.L_max + 1) * (paramb.L_max + 1) - 1; ++abc) {
-        g_sum_fxyz[static_cast<size_t>(N) * (n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) + n1] = s[abc];
+        g_sum_fxyz
+          [static_cast<size_t>(N) * (n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) +
+           n1] = s[abc];
       }
     }
 
@@ -1887,7 +1928,7 @@ void NEP_MULTIGPU::compute(
       CHECK(gpuMemcpy(
         nep_data[gpu].position.data() + nep_temp_data.num_atoms_per_gpu * d,
         nep_temp_data.position.data() + nep_temp_data.num_atoms_per_gpu * d,
-        sizeof(double) * nep_data[gpu].N3,
+        sizeof(float) * nep_data[gpu].N3,
         gpuMemcpyDeviceToDevice));
     }
   }
@@ -1918,6 +1959,7 @@ void NEP_MULTIGPU::compute(
       nep_data[gpu].stream>>>(
       paramb,
       partition_direction,
+      1.0 / rc_cell_list,
       nep_temp_data.num_atoms_per_gpu,
       nep_data[gpu].N4,
       nep_data[gpu].N5,

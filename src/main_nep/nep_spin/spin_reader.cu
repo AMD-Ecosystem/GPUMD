@@ -1,7 +1,22 @@
 /*
     Copyright 2017 Zheyong Fan and GPUMD development team
-    This file is part of GPUMD and is distributed under LGPLv3 or later.
+    This file is part of GPUMD.
+    GPUMD is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+    GPUMD is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Lesser General Public License for more details.
+    You should have received a copy of the GNU Lesser General Public License
+    along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
 */
+
+/*----------------------------------------------------------------------------80
+Major contributors:
+  Chengbing Chen: Initial implementation.
+------------------------------------------------------------------------------*/
 
 #include "main_nep/xyz_reader.cuh"
 #include "nep_spin.cuh"
@@ -11,8 +26,70 @@
 #include <array>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <sstream>
+
+// Spin keeps the original double geometry independently of Structure's float data.
+static void read_spin_geometry(const XYZ_Record& record, Spin_Data::Geometry& geometry)
+{
+  bool has_cell = false;
+  for (size_t n = 0; n < record.tokens.size(); ++n) {
+    const std::string key = "lattice=";
+    if (record.tokens[n].compare(0, key.size(), key) != 0)
+      continue;
+    record.validate_array(n, 9);
+    const int transpose[9] = {0, 3, 6, 1, 4, 7, 2, 5, 8};
+    for (int k = 0; k < 9; ++k) {
+      const auto& token = record.tokens[n + k];
+      const size_t start = k == 0 ? key.size() + 1 : 0;
+      geometry.cell[transpose[k]] = get_double_from_token(
+        token.substr(start, token.size() - start - (k == 8)),
+        record.filename.c_str(),
+        record.comment_line_number);
+    }
+    has_cell = true;
+  }
+  if (!has_cell)
+    PRINT_INPUT_ERROR("'lattice' is missing in the second line of a frame.");
+  const int pos = record.get_property_offset("pos", 'R', 3);
+  if (pos < 0)
+    PRINT_INPUT_ERROR("'pos' is missing in properties.");
+  geometry.position.resize(record.num_atoms);
+  for (int a = 0; a < record.num_atoms; ++a)
+    for (int d = 0; d < 3; ++d)
+      geometry.position[a][d] = get_double_from_token(
+        record.atoms[a][pos + d], record.filename.c_str(), record.comment_line_number + a + 1);
+}
+
+static void read_spin_tensor(const XYZ_Record& record, size_t first, double scale, float* result)
+{
+  record.validate_array(first, 9);
+  double tensor[9];
+  for (int k = 0; k < 9; ++k) {
+    const auto& token = record.tokens[first + k];
+    const size_t start = k == 0 ? token.find('"') + 1 : 0;
+    tensor[k] = get_double_from_token(
+      token.substr(start, token.size() - start - (k == 8)),
+      record.filename.c_str(),
+      record.comment_line_number);
+  }
+  const double projected[9] = {
+    tensor[0] * scale,
+    tensor[4] * scale,
+    tensor[8] * scale,
+    (tensor[1] + tensor[3]) * (.5 * scale),
+    (tensor[5] + tensor[7]) * (.5 * scale),
+    (tensor[6] + tensor[2]) * (.5 * scale),
+    (tensor[1] - tensor[3]) * (.5 * scale),
+    (tensor[5] - tensor[7]) * (.5 * scale),
+    (tensor[6] - tensor[2]) * (.5 * scale)};
+  for (int d = 0; d < 9; ++d) {
+    if (!std::isfinite(projected[d]) || std::abs(projected[d]) > std::numeric_limits<float>::max())
+      PRINT_INPUT_ERROR("Per-atom virial values must be finite and within the float range.");
+    result[d] = projected[d];
+  }
+}
 
 // A local displacement for differentiating a sampled spin path. The sphere log
 // keeps fixed-length rotations tangent, while the separate radial difference
@@ -55,29 +132,57 @@ static bool rotation_displacement(
   return true;
 }
 
-static std::string frame_key(const Structure& geometry, const Spin_Data::Labels& label)
+static std::string frame_key(const Structure& geometry, const Spin_Data::FrameInput& label)
 {
   std::ostringstream key;
   key << std::hexfloat;
   for (int t : geometry.type)
     key << t << ',';
   key << ';';
-  for (float x : geometry.box_original)
-    key << x << ',';
-  for (const auto* values :
-       {&geometry.x, &geometry.y, &geometry.z, &label.sx, &label.sy, &label.sz}) {
+  auto append = [&](double x) { key << (x == 0.0 ? 0.0 : x) << ','; };
+  for (double x : label.geometry.cell)
+    append(x);
+  for (const auto& position : label.geometry.position)
+    for (double x : position)
+      append(x);
+  for (const auto* values : {&label.sx, &label.sy, &label.sz}) {
     key << ';';
-    for (float x : *values)
-      key << x << ',';
+    for (double x : *values)
+      append(x);
   }
   return key.str();
 }
 
 void NEP_Spin_Model::Spin_Reader::read_structure(const XYZ_Record& record, Structure& structure)
 {
-  NEP_Energy_Reader::read_structure(record, structure);
   labels.emplace_back();
   auto& label = labels.back();
+  read_spin_geometry(record, label.geometry);
+  for (const auto& token : record.tokens) {
+    if (token.compare(0, 7, "stress=") == 0)
+      PRINT_INPUT_ERROR(
+        "NEP-Spin does not accept stress labels. Use the nine-component virial field.");
+  }
+
+  float virial[9] = {};
+  bool has_virial = false;
+  // Common energy/force handling receives no model-specific tensor labels.
+  XYZ_Record energy_record = record;
+  for (size_t n = 0; n < record.tokens.size(); ++n) {
+    if (record.tokens[n].compare(0, 7, "virial=") != 0)
+      continue;
+    read_spin_tensor(record, n, 1.0 / record.num_atoms, virial);
+    has_virial = true;
+    energy_record.tokens.erase(
+      energy_record.tokens.begin() + n, energy_record.tokens.begin() + n + 9);
+    break;
+  }
+  NEP_Energy_Reader::read_structure(energy_record, structure);
+  if (has_virial) {
+    structure.has_virial = true;
+    std::copy_n(virial, 6, structure.virial);
+    std::copy_n(virial + 6, 3, label.antisymmetric_virial.begin());
+  }
   int spin_offset = -1, mforce_offset = -1, offset = 0;
   for (int k = 0; k < record.properties.size() / 3; ++k) {
     const auto& name = record.properties[3 * k];
@@ -100,9 +205,11 @@ void NEP_Spin_Model::Spin_Reader::read_structure(const XYZ_Record& record, Struc
     offset += count;
   }
   if (spin_offset < 0)
-    PRINT_INPUT_ERROR("spin_version 1 requires spin/spins/moment/moments with property type R:3.");
+    PRINT_INPUT_ERROR("NEP-spin requires spin/spins/moment/moments with property type R:3.");
   label.has_mforce = mforce_offset >= 0;
-  for (auto* values : {&label.sx, &label.sy, &label.sz, &label.mfx, &label.mfy, &label.mfz})
+  for (auto* values : {&label.sx, &label.sy, &label.sz})
+    values->resize(structure.num_atom, 0.0);
+  for (auto* values : {&label.mfx, &label.mfy, &label.mfz})
     values->resize(structure.num_atom, 0.0f);
   for (int a = 0; a < structure.num_atom; ++a) {
     auto value = [&](int i) {
@@ -161,6 +268,25 @@ void NEP_Spin_Model::Spin_Reader::read_structure(const XYZ_Record& record, Struc
 void NEP_Spin_Model::Spin_Reader::prepare_train(
   std::vector<Structure>& structures, int batch_size, int& batches, std::vector<int>& sizes)
 {
+  if (parameters.needs_spin_wall_bounds()) {
+    const double infinity = std::numeric_limits<double>::infinity();
+    std::vector<double> minima(parameters.num_types, infinity);
+    std::vector<double> maxima(parameters.num_types, -infinity);
+    for (const auto& structure : structures) {
+      const auto& label = labels.at(structure.index_in_file);
+      for (int a = 0; a < structure.num_atom; ++a) {
+        const int type = structure.type[a];
+        if (!parameters.spin_type_active[type])
+          continue;
+        const double norm = std::hypot(std::hypot(label.sx[a], label.sy[a]), label.sz[a]);
+        if (!std::isfinite(norm))
+          PRINT_INPUT_ERROR("Cannot resolve spin wall auto from a non-finite training moment.");
+        minima[type] = std::min(minima[type], norm);
+        maxima[type] = std::max(maxima[type], norm);
+      }
+    }
+    parameters.resolve_spin_wall_bounds(minima, maxima);
+  }
   for (const auto& structure : structures) {
     const auto& label = labels.at(structure.index_in_file);
     if (label.has_spin_response_metadata)
@@ -190,12 +316,17 @@ void NEP_Spin_Model::Spin_Reader::prepare_dataset(Dataset& dataset)
 const char* NEP_Spin_Model::Spin_Reader::energy_difference_conflict(
   const Structure& a, const Structure& b) const
 {
-  const char* conflict = NEP_Energy_Reader::energy_difference_conflict(a, b);
-  if (!conflict)
+  if (a.num_atom != b.num_atom || a.type != b.type || a.pbc != b.pbc)
     return nullptr;
   const auto& x = labels.at(a.index_in_file);
   const auto& y = labels.at(b.index_in_file);
+  for (int d = 0; a.pbc && d < 9; ++d)
+    if (std::abs(x.geometry.cell[d] - y.geometry.cell[d]) > 1e-5f)
+      return nullptr;
   for (int i = 0; i < a.num_atom; ++i) {
+    for (int d = 0; d < 3; ++d)
+      if (std::abs(x.geometry.position[i][d] - y.geometry.position[i][d]) > 1e-5f)
+        return nullptr;
     if (
       std::abs(x.sx[i] - y.sx[i]) > 1e-5f || std::abs(x.sy[i] - y.sy[i]) > 1e-5f ||
       std::abs(x.sz[i] - y.sz[i]) > 1e-5f)
@@ -204,7 +335,7 @@ const char* NEP_Spin_Model::Spin_Reader::energy_difference_conflict(
   return "have the same geometry and spins, for which the model predicts the same energy.";
 }
 void NEP_Spin_Model::Spin_Reader::read_response(
-  std::vector<Structure>& structures, std::vector<Spin_Data::Labels>& response_labels)
+  std::vector<Structure>& structures, std::vector<Spin_Data::FrameInput>& response_labels)
 {
   std::ifstream input("response.xyz");
   if (!input.is_open())
@@ -252,9 +383,8 @@ void NEP_Spin_Model::Spin_Reader::derive_spin_response_tangents(std::vector<Fram
     PRINT_INPUT_ERROR("lambda_spin_response requires rotation response frames in response.xyz.\n");
   }
 
-  const auto differs = [](const float left, const float right) {
-    return !std::isfinite(left) || !std::isfinite(right) ||
-           std::abs(static_cast<double>(left) - static_cast<double>(right)) > 1.0e-6;
+  const auto differs = [](double left, double right) {
+    return !std::isfinite(left) || !std::isfinite(right) || std::abs(left - right) > 1.0e-6;
   };
   for (auto& item : groups) {
     auto& members = item.second;
@@ -286,16 +416,16 @@ void NEP_Spin_Model::Spin_Reader::derive_spin_response_tangents(std::vector<Fram
         PRINT_INPUT_ERROR("A rotation response_group cannot change atom count, type, or order.\n");
       }
       for (int d = 0; d < 9; ++d) {
-        if (differs(structure.geometry.box_original[d], reference.geometry.box_original[d])) {
+        if (differs(structure.label.geometry.cell[d], reference.label.geometry.cell[d])) {
           PRINT_INPUT_ERROR("A rotation response_group cannot change its cell.\n");
         }
       }
       for (int atom = 0; atom < structure.geometry.num_atom; ++atom) {
-        if (
-          differs(structure.geometry.x[atom], reference.geometry.x[atom]) ||
-          differs(structure.geometry.y[atom], reference.geometry.y[atom]) ||
-          differs(structure.geometry.z[atom], reference.geometry.z[atom])) {
-          PRINT_INPUT_ERROR("A rotation response_group cannot change atomic positions.\n");
+        for (int d = 0; d < 3; ++d) {
+          if (differs(
+                structure.label.geometry.position[atom][d],
+                reference.label.geometry.position[atom][d]))
+            PRINT_INPUT_ERROR("A rotation response_group cannot change atomic positions.\n");
         }
         if (
           !std::isfinite(structure.label.mfx[atom]) || !std::isfinite(structure.label.mfy[atom]) ||

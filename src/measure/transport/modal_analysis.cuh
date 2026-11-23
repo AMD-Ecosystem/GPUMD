@@ -13,18 +13,14 @@
     along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-/*----------------------------------------------------------------------------80
-GPUMD Contributing author: Alexander Gabourie (Stanford University)
-------------------------------------------------------------------------------*/
-
 #pragma once
 #include "measure/action.cuh"
 #include "utilities/common.cuh"
 #include "utilities/gpu_vector.cuh"
 #ifdef USE_HIP
-  #include <hipblas/hipblas.h>
+#include <hipblas/hipblas.h>
 #else
-  #include <cublas_v2.h>
+#include <cublas_v2.h>
 #endif
 #include <fstream>
 #include <iostream>
@@ -60,9 +56,7 @@ public:
   GPU_Vector<float> eigz;
 
   // modal velocities
-  GPU_Vector<float> xdotx;
-  GPU_Vector<float> xdoty;
-  GPU_Vector<float> xdotz;
+  GPU_Vector<float> xdot;
 
   // precalculated mass values
   GPU_Vector<float> sqrtmass;
@@ -100,18 +94,18 @@ public:
     Force& force);
 
   virtual void end_of_step(
-      const int number_of_steps,
-      int step,
-      const int fixed_group,
-      const int move_group,
-      const double global_time,
-      const double temperature,
-      Integrate& integrate,
-      Box& box,
-      std::vector<Group>& group,
-      GPU_Vector<double>& thermo,
-      Atom& atom,
-      Force& force);
+    const int number_of_steps,
+    int step,
+    const int fixed_group,
+    const int move_group,
+    const double global_time,
+    const double temperature,
+    Integrate& integrate,
+    Box& box,
+    std::vector<Group>& group,
+    GPU_Vector<double>& thermo,
+    Atom& atom,
+    Force& force);
 
   virtual void post_run(
     Atom& atom,
@@ -122,13 +116,9 @@ public:
     const double temperature);
 
   MODAL_ANALYSIS(
-    const std::vector<std::string>& tokens,
-    const int number_of_types,
-    int method_input);
-  void parse_compute_gkma(
-    const std::vector<std::string>& tokens, const int number_of_types);
-  void parse_compute_hnema(
-    const std::vector<std::string>& tokens, const int number_of_types);
+    const std::vector<std::string>& tokens, const int number_of_types, int method_input);
+  void parse_compute_gkma(const std::vector<std::string>& tokens, const int number_of_types);
+  void parse_compute_hnema(const std::vector<std::string>& tokens, const int number_of_types);
 
 private:
   int samples_per_output; // samples to be averaged for output

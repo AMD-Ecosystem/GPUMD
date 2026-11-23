@@ -15,6 +15,9 @@
 
 /*----------------------------------------------------------------------------80
 The class defining the simulation box.
+
+Major contributors:
+  Zheyong Fan: Initial implementation.
 ------------------------------------------------------------------------------*/
 
 #include "box.cuh"
@@ -50,7 +53,7 @@ double Box::get_area(const int d) const
 double Box::get_volume(void) const
 {
   double volume;
-  volume = abs(
+  volume = std::abs(
     cpu_h[0] * (cpu_h[4] * cpu_h[8] - cpu_h[5] * cpu_h[7]) +
     cpu_h[1] * (cpu_h[5] * cpu_h[6] - cpu_h[3] * cpu_h[8]) +
     cpu_h[2] * (cpu_h[3] * cpu_h[7] - cpu_h[4] * cpu_h[6]));
@@ -110,7 +113,8 @@ bool Box::get_num_bins(const double rc, int num_bins[])
 
 void Box::set_is_orthogonal()
 {
-  is_orthogonal = cpu_h[1] == 0 && cpu_h[2] == 0 && cpu_h[3] == 0 && cpu_h[5] == 0 && cpu_h[6] == 0 && cpu_h[7] == 0;
+  is_orthogonal = cpu_h[1] == 0 && cpu_h[2] == 0 && cpu_h[3] == 0 && cpu_h[5] == 0 &&
+                  cpu_h[6] == 0 && cpu_h[7] == 0;
   for (int d = 0; d < 18; ++d) {
     float_h[d] = cpu_h[d];
   }

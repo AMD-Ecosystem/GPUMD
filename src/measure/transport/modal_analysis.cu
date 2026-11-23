@@ -26,14 +26,17 @@ The code here is inspired by the LAMMPS implementation provided by the Henry
 group at MIT. This code can be found:
 https://drive.google.com/open?id=1IHJ7x-bLZISX3I090dW_Y_y-Mqkn07zg
 
-GPUMD Contributing author: Alexander Gabourie (Stanford University)
+Major contributors:
+  Alexander J. Gabourie: Initial implementation.
+  Zheyong Fan: Corrected modal velocities and participating-atom ranges.
 ------------------------------------------------------------------------------*/
 
-#include "modal_analysis.cuh"
 #include "hnemd_force.cuh"
+#include "modal_analysis.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#include <cmath>
 #include <cstring>
 
 #define NUM_OF_HEAT_COMPONENTS 5
@@ -292,7 +295,7 @@ void MODAL_ANALYSIS::compute_heat(
     mvx.data(),
     stride,
     &beta,
-    xdotx.data(),
+    xdot.data(),
     stride);
   gpublasSgemv(
     ma_handle,
@@ -304,8 +307,8 @@ void MODAL_ANALYSIS::compute_heat(
     num_modes,
     mvy.data(),
     stride,
-    &beta,
-    xdoty.data(),
+    &alpha,
+    xdot.data(),
     stride);
   gpublasSgemv(
     ma_handle,
@@ -317,8 +320,8 @@ void MODAL_ANALYSIS::compute_heat(
     num_modes,
     mvz.data(),
     stride,
-    &beta,
-    xdotz.data(),
+    &alpha,
+    xdot.data(),
     stride);
 
   // Calculate intermediate value
@@ -377,7 +380,7 @@ void MODAL_ANALYSIS::compute_heat(
     3,
     jmx.data(),
     num_modes,
-    xdotx.data(),
+    xdot.data(),
     stride,
     jmx.data(),
     num_modes);
@@ -388,7 +391,7 @@ void MODAL_ANALYSIS::compute_heat(
     3,
     jmy.data(),
     num_modes,
-    xdoty.data(),
+    xdot.data(),
     stride,
     jmy.data(),
     num_modes);
@@ -399,7 +402,7 @@ void MODAL_ANALYSIS::compute_heat(
     3,
     jmz.data(),
     num_modes,
-    xdotz.data(),
+    xdot.data(),
     stride,
     jmz.data(),
     num_modes);
@@ -423,7 +426,7 @@ void MODAL_ANALYSIS::setN(const std::vector<int>& cpu_type_size)
   for (int n = 0; n < atom_begin; ++n) {
     N1 += cpu_type_size[n];
   }
-  for (int n = atom_begin; n <= atom_end; ++n) {
+  for (int n = 0; n <= atom_end; ++n) {
     N2 += cpu_type_size[n];
   }
 
@@ -482,19 +485,19 @@ void MODAL_ANALYSIS::pre_run(
     float om2;
     for (int i = 0; i < num_modes; i++) {
       eigfile.read((char*)(&om2), sizeof(float));
-      f[i] = copysign(sqrt(abs(om2)) / (2.0 * PI), om2);
+      f[i] = copysign(sqrt(std::abs(om2)) / (2.0 * PI), om2);
     }
     double fmax, fmin; // freq are in ascending order in file
     int shift;
     const double epsilon = 1.e-6;
-    fmax = (floor(abs(f[num_modes - 1]) / f_bin_size) + 1) * f_bin_size;
-    fmin = floor(abs(f[0]) / f_bin_size) * f_bin_size;
-    shift = floor(abs(fmin) / f_bin_size + epsilon);
+    fmax = (floor(std::abs(f[num_modes - 1]) / f_bin_size) + 1) * f_bin_size;
+    fmin = floor(std::abs(f[0]) / f_bin_size) * f_bin_size;
+    shift = floor(std::abs(fmin) / f_bin_size + epsilon);
     num_bins = floor((fmax - fmin) / f_bin_size + epsilon);
 
     bin_count.resize(num_bins, 0, Memory_Type::managed);
     for (int i = 0; i < num_modes; i++)
-      bin_count[int(abs(f[i] / f_bin_size)) - shift]++;
+      bin_count[int(std::abs(f[i] / f_bin_size)) - shift]++;
 
   } else {
     num_bins = (int)ceil((double)num_modes / (double)bin_size);
@@ -527,9 +530,7 @@ void MODAL_ANALYSIS::pre_run(
   mvz.resize(num_participating, Memory_Type::managed);
 
   // Allocate modal velocities
-  xdotx.resize(num_modes, Memory_Type::managed);
-  xdoty.resize(num_modes, Memory_Type::managed);
-  xdotz.resize(num_modes, Memory_Type::managed);
+  xdot.resize(num_modes, Memory_Type::managed);
 
   // Allocate modal measured quantities
   size_t jmxyz_size = num_modes * 3;
@@ -571,13 +572,7 @@ void MODAL_ANALYSIS::post_force(
     return;
 
   apply_hnemd_force(
-    atom.number_of_atoms,
-    fe_x,
-    fe_y,
-    fe_z,
-    atom.virial_per_atom,
-    atom.force_per_atom,
-    force_sum_);
+    atom.number_of_atoms, fe_x, fe_y, fe_z, atom.virial_per_atom, atom.force_per_atom, force_sum_);
 }
 
 void MODAL_ANALYSIS::end_of_step(
@@ -609,7 +604,8 @@ void MODAL_ANALYSIS::end_of_step(
   GPU_CHECK_KERNEL
 
   if (method == HNEMA_METHOD) {
-    float factor = KAPPA_UNIT_CONVERSION / (box.get_volume() * temperature * fe * (float)samples_per_output);
+    float factor =
+      KAPPA_UNIT_CONVERSION / (box.get_volume() * temperature * fe * (float)samples_per_output);
     int num_bins_stored = num_bins * NUM_OF_HEAT_COMPONENTS;
     gpu_scale_jm<<<(num_bins_stored - 1) / BLOCK_SIZE + 1, BLOCK_SIZE>>>(
       num_bins_stored, factor, bin_out.data());
@@ -655,9 +651,7 @@ void MODAL_ANALYSIS::post_run(
 }
 
 MODAL_ANALYSIS::MODAL_ANALYSIS(
-  const std::vector<std::string>& tokens,
-  const int number_of_types,
-  int method_input)
+  const std::vector<std::string>& tokens, const int number_of_types, int method_input)
 {
   if (method_input == 0) {
     parse_compute_gkma(tokens, number_of_types);
@@ -687,8 +681,7 @@ void MODAL_ANALYSIS::parse_compute_gkma(
     PRINT_INPUT_ERROR("compute_gkma should have 5 parameters.\n");
   }
   if (
-    !is_valid_int(tokens[1], &sample_interval) ||
-    !is_valid_int(tokens[2], &first_mode) ||
+    !is_valid_int(tokens[1], &sample_interval) || !is_valid_int(tokens[2], &first_mode) ||
     !is_valid_int(tokens[3], &last_mode)) {
     PRINT_INPUT_ERROR("A parameter for GKMA should be an integer.\n");
   }
@@ -742,9 +735,7 @@ void MODAL_ANALYSIS::parse_compute_gkma(
   // Hidden feature implementation
   if (num_param == 9) {
     if (tokens[6] == "atom_range") {
-      if (
-        !is_valid_int(tokens[7], &atom_begin) ||
-        !is_valid_int(tokens[8], &atom_end)) {
+      if (!is_valid_int(tokens[7], &atom_begin) || !is_valid_int(tokens[8], &atom_end)) {
         PRINT_INPUT_ERROR("GKMA atom_begin & atom_end must be integers.\n");
       }
       if (atom_begin > atom_end) {
@@ -772,8 +763,7 @@ void MODAL_ANALYSIS::parse_compute_gkma(
 }
 
 void MODAL_ANALYSIS::parse_compute_hnema(
-  const std::vector<std::string>& tokens,
-  const int number_of_types)
+  const std::vector<std::string>& tokens, const int number_of_types)
 {
   const int num_param = tokens.size();
   compute = 1;
@@ -791,10 +781,8 @@ void MODAL_ANALYSIS::parse_compute_hnema(
     PRINT_INPUT_ERROR("compute_hnema should have 9 parameters.\n");
   }
   if (
-    !is_valid_int(tokens[1], &sample_interval) ||
-    !is_valid_int(tokens[2], &output_interval) ||
-    !is_valid_int(tokens[6], &first_mode) ||
-    !is_valid_int(tokens[7], &last_mode)) {
+    !is_valid_int(tokens[1], &sample_interval) || !is_valid_int(tokens[2], &output_interval) ||
+    !is_valid_int(tokens[6], &first_mode) || !is_valid_int(tokens[7], &last_mode)) {
     PRINT_INPUT_ERROR("A parameter for HNEMA should be an integer.\n");
   }
 
@@ -867,9 +855,7 @@ void MODAL_ANALYSIS::parse_compute_hnema(
   // Hidden feature implementation
   if (num_param == 13) {
     if (tokens[10] == "atom_range") {
-      if (
-        !is_valid_int(tokens[11], &atom_begin) ||
-        !is_valid_int(tokens[12], &atom_end)) {
+      if (!is_valid_int(tokens[11], &atom_begin) || !is_valid_int(tokens[12], &atom_end)) {
         PRINT_INPUT_ERROR("HNEMA atom_begin & atom_end must be integers.\n");
       }
       if (atom_begin > atom_end) {

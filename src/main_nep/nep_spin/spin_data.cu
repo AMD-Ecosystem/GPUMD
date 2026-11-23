@@ -1,9 +1,23 @@
 /*
     Copyright 2017 Zheyong Fan and GPUMD development team
-    This file is part of GPUMD and is distributed under LGPLv3 or later.
+    This file is part of GPUMD.
+    GPUMD is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+    GPUMD is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Lesser General Public License for more details.
+    You should have received a copy of the GNU Lesser General Public License
+    along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-#include "main_nep/mic.cuh"
+/*----------------------------------------------------------------------------80
+Major contributors:
+  Chengbing Chen: Initial implementation.
+------------------------------------------------------------------------------*/
+
 #include "spin_data.cuh"
 #include "utilities/error.cuh"
 #include <algorithm>
@@ -17,11 +31,11 @@ static __global__ void gpu_find_spin_neighbors(
   const int* Na_sum,
   const float rc_spin,
   const float* __restrict__ g_box,
-  const float* __restrict__ g_box_original,
+  const double* __restrict__ g_box_original,
   const int* __restrict__ g_num_cell,
-  const float* x,
-  const float* y,
-  const float* z,
+  const double* x,
+  const double* y,
+  const double* z,
   const int plane_size,
   int* NN_spin,
   int* NL_spin,
@@ -30,10 +44,10 @@ static __global__ void gpu_find_spin_neighbors(
   const int N1 = Na_sum[blockIdx.x];
   const int N2 = N1 + Na[blockIdx.x];
   const float* box = g_box + 18 * blockIdx.x;
-  const float* box_original = g_box_original + 9 * blockIdx.x;
+  const double* box_original = g_box_original + 9 * blockIdx.x;
   const int* num_cell = g_num_cell + 3 * blockIdx.x;
   for (int n1 = N1 + threadIdx.x; n1 < N2; n1 += blockDim.x) {
-    const float x1 = x[n1], y1 = y[n1], z1 = z[n1];
+    const double x1 = x[n1], y1 = y[n1], z1 = z[n1];
     int count = 0;
     for (int n2 = N1; n2 < N2; ++n2) {
       for (int ia = 0; ia < num_cell[0]; ++ia) {
@@ -41,20 +55,31 @@ static __global__ void gpu_find_spin_neighbors(
           for (int ic = 0; ic < num_cell[2]; ++ic) {
             if (ia == 0 && ib == 0 && ic == 0 && n1 == n2)
               continue;
-            float dx = box_original[0] * ia + box_original[1] * ib + box_original[2] * ic;
-            float dy = box_original[3] * ia + box_original[4] * ib + box_original[5] * ic;
-            float dz = box_original[6] * ia + box_original[7] * ib + box_original[8] * ic;
-            float x12 = x[n2] + dx - x1;
-            float y12 = y[n2] + dy - y1;
-            float z12 = z[n2] + dz - z1;
-            dev_apply_mic(box, x12, y12, z12);
+            const double x12_image =
+              box_original[0] * ia + box_original[1] * ib + box_original[2] * ic;
+            const double y12_image =
+              box_original[3] * ia + box_original[4] * ib + box_original[5] * ic;
+            const double z12_image =
+              box_original[6] * ia + box_original[7] * ib + box_original[8] * ic;
+            double x12 = x[n2] + x12_image - x1;
+            double y12 = y[n2] + y12_image - y1;
+            double z12 = z[n2] + z12_image - z1;
+            // The inverse selects the image; form its Cartesian displacement from the input cell.
+            const double sx = num_cell[0] * nearbyint(box[9] * x12 + box[10] * y12 + box[11] * z12);
+            const double sy =
+              num_cell[1] * nearbyint(box[12] * x12 + box[13] * y12 + box[14] * z12);
+            const double sz =
+              num_cell[2] * nearbyint(box[15] * x12 + box[16] * y12 + box[17] * z12);
+            x12 -= box_original[0] * sx + box_original[1] * sy + box_original[2] * sz;
+            y12 -= box_original[3] * sx + box_original[4] * sy + box_original[5] * sz;
+            z12 -= box_original[6] * sx + box_original[7] * sy + box_original[8] * sz;
             if (x12 * x12 + y12 * y12 + z12 * z12 < rc_spin * rc_spin) {
               if (Store) {
                 const int index = n1 + N * count;
                 NL_spin[index] = n2;
                 r12_spin[index] = x12;
-                r12_spin[plane_size + index] = y12;
-                r12_spin[2 * plane_size + index] = z12;
+                r12_spin[size_t(plane_size) + index] = y12;
+                r12_spin[2 * size_t(plane_size) + index] = z12;
               }
               ++count;
             }
@@ -66,11 +91,14 @@ static __global__ void gpu_find_spin_neighbors(
   }
 }
 
-void Spin_Data::construct(Spin_Parameters& para, Dataset& dataset, const std::vector<Labels>& input)
+void Spin_Data::construct(
+  Spin_Parameters& para, Dataset& dataset, const std::vector<FrameInput>& input)
 {
   const int N = dataset.N, Nc = dataset.Nc;
   labels.reserve(Nc);
-  std::vector<double> position(3 * N), moments(3 * N);
+  dataset.virial.resize(size_t(9) * N);
+  dataset.virial_cpu.resize(size_t(9) * N);
+  std::vector<double> position(3 * N), moments(3 * N), cells(9 * Nc);
   mforce_ref_cpu.resize(3 * N);
   mforce_cpu.resize(3 * N);
   has_mforce_cpu.resize(Nc);
@@ -78,7 +106,9 @@ void Spin_Data::construct(Spin_Parameters& para, Dataset& dataset, const std::ve
   torque_active_count_cpu.assign(Nc, 0);
   for (int n = 0; n < Nc; ++n) {
     const auto& structure = dataset.structures[n];
-    labels.push_back(input.at(structure.index_in_file));
+    const auto& frame = input.at(structure.index_in_file);
+    std::copy(frame.geometry.cell.begin(), frame.geometry.cell.end(), cells.data() + 9 * n);
+    labels.push_back(frame);
     const auto& label = labels.back();
     has_mforce_cpu[n] = label.has_mforce;
     for (int a = 0; a < structure.num_atom; ++a) {
@@ -92,9 +122,8 @@ void Spin_Data::construct(Spin_Parameters& para, Dataset& dataset, const std::ve
           ++torque_active_count_cpu[n];
       }
       const int i = dataset.Na_sum_cpu[n] + a;
-      position[i] = structure.x[a];
-      position[N + i] = structure.y[a];
-      position[2 * N + i] = structure.z[a];
+      for (int d = 0; d < 3; ++d)
+        position[d * N + i] = frame.geometry.position[a][d];
       moments[i] = label.sx[a];
       moments[N + i] = label.sy[a];
       moments[2 * N + i] = label.sz[a];
@@ -107,6 +136,13 @@ void Spin_Data::construct(Spin_Parameters& para, Dataset& dataset, const std::ve
   r_spin.copy_from_host(position.data());
   spin.resize(3 * N);
   spin.copy_from_host(moments.data());
+  std::vector<float> antisymmetric(3 * Nc);
+  for (int n = 0; n < Nc; ++n) {
+    for (int d = 0; d < 3; ++d)
+      antisymmetric[d * Nc + n] = labels[n].antisymmetric_virial[d];
+  }
+  antisymmetric_virial_ref_gpu.resize(antisymmetric.size());
+  antisymmetric_virial_ref_gpu.copy_from_host(antisymmetric.data());
   mforce.resize(3 * N);
   mforce.fill(0.0f);
   mforce_ref_gpu.resize(3 * N);
@@ -115,6 +151,8 @@ void Spin_Data::construct(Spin_Parameters& para, Dataset& dataset, const std::ve
   has_mforce_gpu.copy_from_host(has_mforce_cpu.data());
   spin_type_active_gpu.resize(para.num_types);
   spin_type_active_gpu.copy_from_host(para.spin_type_active.data());
+  GPU_Vector<double> cell_gpu(cells.size());
+  cell_gpu.copy_from_host(cells.data());
   NN_spin.resize(N);
   gpu_find_spin_neighbors<false><<<Nc, 256>>>(
     N,
@@ -122,11 +160,11 @@ void Spin_Data::construct(Spin_Parameters& para, Dataset& dataset, const std::ve
     dataset.Na_sum.data(),
     para.spin_cutoff,
     dataset.box.data(),
-    dataset.box_original.data(),
+    cell_gpu.data(),
     dataset.num_cell.data(),
-    dataset.r.data(),
-    dataset.r.data() + N,
-    dataset.r.data() + 2 * N,
+    r_spin.data(),
+    r_spin.data() + N,
+    r_spin.data() + 2 * N,
     0,
     NN_spin.data(),
     nullptr,
@@ -147,17 +185,107 @@ void Spin_Data::construct(Spin_Parameters& para, Dataset& dataset, const std::ve
     dataset.Na_sum.data(),
     para.spin_cutoff,
     dataset.box.data(),
-    dataset.box_original.data(),
+    cell_gpu.data(),
     dataset.num_cell.data(),
-    dataset.r.data(),
-    dataset.r.data() + N,
-    dataset.r.data() + 2 * N,
+    r_spin.data(),
+    r_spin.data() + N,
+    r_spin.data() + 2 * N,
     static_cast<int>(slots),
     NN_spin.data(),
     NL_spin.data(),
     r12_spin.data());
   GPU_CHECK_KERNEL
 }
+static __global__ void gpu_sum_spin_virial_error(
+  const int N,
+  const float shear_weight,
+  const int* g_Na,
+  const int* g_Na_sum,
+  const float* g_virial,
+  const float* g_virial_ref,
+  const float* antisymmetric_ref,
+  float* error_gpu)
+{
+  int tid = threadIdx.x;
+  int bid = blockIdx.x;
+  int Na = g_Na[bid];
+  int N1 = g_Na_sum[bid];
+  int N2 = N1 + Na;
+  extern __shared__ float s_virial[];
+  for (int d = 0; d < 9; ++d) {
+    s_virial[d * blockDim.x + tid] = 0.0f;
+  }
+
+  for (int n = N1 + tid; n < N2; n += blockDim.x) {
+    for (int d = 0; d < 9; ++d) {
+      s_virial[d * blockDim.x + tid] += g_virial[d * N + n];
+    }
+  }
+  __syncthreads();
+
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      for (int d = 0; d < 9; ++d) {
+        s_virial[d * blockDim.x + tid] += s_virial[d * blockDim.x + tid + offset];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    float error_sum = 0.0f;
+    // Each symmetric mean and antisymmetric half-difference contributes twice
+    // to the squared norm of the reconstructed off-diagonal entries.
+    const float off_diagonal_weight = 2.0f * shear_weight;
+    for (int d = 0; d < 9; ++d) {
+      const float reference =
+        d < 6 ? g_virial_ref[d * gridDim.x + bid] : antisymmetric_ref[(d - 6) * gridDim.x + bid];
+      const float diff = s_virial[d * blockDim.x] / Na - reference;
+      error_sum += (d >= 3) ? (off_diagonal_weight * diff * diff) : (diff * diff);
+    }
+    error_gpu[bid] = error_sum;
+  }
+}
+
+std::vector<float>
+Spin_Data::get_rmse_virial(Spin_Parameters& para, Dataset& data, bool use_weight, int device_id)
+{
+  CHECK(gpuSetDevice(device_id));
+  const int block_size = 256;
+  const float shear_weight = use_weight ? para.lambda_shear * para.lambda_shear : 1.0f;
+  gpu_sum_spin_virial_error<<<data.Nc, block_size, sizeof(float) * block_size * 9>>>(
+    data.N,
+    shear_weight,
+    data.Na.data(),
+    data.Na_sum.data(),
+    data.virial.data(),
+    data.virial_ref_gpu.data(),
+    antisymmetric_virial_ref_gpu.data(),
+    data.error_gpu.data());
+  GPU_CHECK_KERNEL
+  data.error_gpu.copy_to_host(data.error_cpu.data());
+
+  std::vector<float> rmse(para.num_types + 1, 0.0f);
+  std::vector<int> count(para.num_types + 1, 0);
+  for (int n = 0; n < data.Nc; ++n) {
+    if (!data.structures[n].has_virial)
+      continue;
+    const float error =
+      use_weight ? data.weight_cpu[n] * data.weight_cpu[n] * data.error_cpu[n] : data.error_cpu[n];
+    for (int t = 0; t <= para.num_types; ++t) {
+      if (data.has_type[t * data.Nc + n]) {
+        rmse[t] += error;
+        count[t] += 9;
+      }
+    }
+  }
+  for (int t = 0; t <= para.num_types; ++t) {
+    if (count[t] > 0)
+      rmse[t] = sqrt(rmse[t] / count[t]);
+  }
+  return rmse;
+}
+
 namespace
 {
 enum class MagneticError { Cartesian, Torque, Parallel, Perpendicular };

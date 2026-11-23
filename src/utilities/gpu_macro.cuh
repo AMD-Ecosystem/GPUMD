@@ -16,14 +16,19 @@
 #pragma once
 
 #ifdef USE_HIP // HIP for AMD card
-#include <hipfft/hipfft.h>
 #include <hip/hip_runtime.h>
+#include <hipfft/hipfft.h>
 
 // memory manipulation
 #define gpuMalloc hipMalloc
 #define gpuMallocManaged hipMallocManaged
+#define gpuHostAlloc hipHostMalloc
+#define gpuHostAllocDefault hipHostMallocDefault
 #define gpuFree hipFree
+#define gpuFreeHost hipHostFree
 #define gpuMemcpy hipMemcpy
+#define gpuMemcpyAsync hipMemcpyAsync
+#define gpuMemcpy2DAsync hipMemcpy2DAsync
 #define gpuMemcpyFromSymbol hipMemcpyFromSymbol
 #define gpuMemcpyToSymbol hipMemcpyToSymbol
 #define gpuGetSymbolAddress hipGetSymbolAddress
@@ -41,6 +46,7 @@
 
 // device manipulation
 #define gpuSetDevice hipSetDevice
+#define gpuGetDevice hipGetDevice
 #define gpuGetDeviceCount hipGetDeviceCount
 #define gpuDeviceProp hipDeviceProp_t
 #define gpuGetDeviceProperties hipGetDeviceProperties
@@ -51,7 +57,19 @@
 // stream
 #define gpuStream_t hipStream_t
 #define gpuStreamCreate hipStreamCreate
+#define gpuStreamCreateWithFlags hipStreamCreateWithFlags
 #define gpuStreamDestroy hipStreamDestroy
+#define gpuStreamSynchronize hipStreamSynchronize
+#define gpuStreamWaitEvent hipStreamWaitEvent
+#define gpuStreamNonBlocking hipStreamNonBlocking
+
+// event
+#define gpuEvent_t hipEvent_t
+#define gpuEventCreateWithFlags hipEventCreateWithFlags
+#define gpuEventDestroy hipEventDestroy
+#define gpuEventRecord hipEventRecord
+#define gpuEventSynchronize hipEventSynchronize
+#define gpuEventDisableTiming hipEventDisableTiming
 
 // random numbers
 #define gpurandState hiprandState
@@ -97,25 +115,27 @@
 #define gpufftHandle hipfftHandle
 #define gpufftComplex hipfftComplex
 #define gpufftExecC2C hipfftExecC2C
-#define gpufftPlan3d hipfftPlan3d 
+#define gpufftPlan3d hipfftPlan3d
 #define gpufftPlanMany hipfftPlanMany
 #define gpufftDestroy hipfftDestroy
+#define gpufftSetStream hipfftSetStream
 #define GPUFFT_SUCCESS HIPFFT_SUCCESS
 #define GPUFFT_C2C HIPFFT_C2C
 #define GPUFFT_FORWARD HIPFFT_FORWARD
 #define GPUFFT_INVERSE HIPFFT_BACKWARD
-
-// warp masks: kernels tile blocks into 32-lane warps, and on a 64-lane
-// wavefront the second tile occupies lanes 32-63
-#define gpuLaneMask(mask) (static_cast<unsigned long long>(mask) << (__lane_id() & 32))
 
 #else // CUDA for Nvidia card
 
 // memory manipulation
 #define gpuMalloc cudaMalloc
 #define gpuMallocManaged cudaMallocManaged
+#define gpuHostAlloc cudaHostAlloc
+#define gpuHostAllocDefault cudaHostAllocDefault
 #define gpuFree cudaFree
+#define gpuFreeHost cudaFreeHost
 #define gpuMemcpy cudaMemcpy
+#define gpuMemcpyAsync cudaMemcpyAsync
+#define gpuMemcpy2DAsync cudaMemcpy2DAsync
 #define gpuMemcpyFromSymbol cudaMemcpyFromSymbol
 #define gpuMemcpyToSymbol cudaMemcpyToSymbol
 #define gpuGetSymbolAddress cudaGetSymbolAddress
@@ -133,6 +153,7 @@
 
 // device manipulation
 #define gpuSetDevice cudaSetDevice
+#define gpuGetDevice cudaGetDevice
 #define gpuGetDeviceCount cudaGetDeviceCount
 #define gpuDeviceProp cudaDeviceProp
 #define gpuGetDeviceProperties cudaGetDeviceProperties
@@ -143,7 +164,19 @@
 // stream
 #define gpuStream_t cudaStream_t
 #define gpuStreamCreate cudaStreamCreate
+#define gpuStreamCreateWithFlags cudaStreamCreateWithFlags
 #define gpuStreamDestroy cudaStreamDestroy
+#define gpuStreamSynchronize cudaStreamSynchronize
+#define gpuStreamWaitEvent cudaStreamWaitEvent
+#define gpuStreamNonBlocking cudaStreamNonBlocking
+
+// event
+#define gpuEvent_t cudaEvent_t
+#define gpuEventCreateWithFlags cudaEventCreateWithFlags
+#define gpuEventDestroy cudaEventDestroy
+#define gpuEventRecord cudaEventRecord
+#define gpuEventSynchronize cudaEventSynchronize
+#define gpuEventDisableTiming cudaEventDisableTiming
 
 // random numbers
 #define gpurandState curandState
@@ -192,15 +225,13 @@
 #define gpufftHandle cufftHandle
 #define gpufftComplex cufftComplex
 #define gpufftExecC2C cufftExecC2C
-#define gpufftPlan3d cufftPlan3d 
+#define gpufftPlan3d cufftPlan3d
 #define gpufftPlanMany cufftPlanMany
 #define gpufftDestroy cufftDestroy
+#define gpufftSetStream cufftSetStream
 #define GPUFFT_SUCCESS CUFFT_SUCCESS
 #define GPUFFT_C2C CUFFT_C2C
 #define GPUFFT_FORWARD CUFFT_FORWARD
 #define GPUFFT_INVERSE CUFFT_INVERSE
-
-// warp masks
-#define gpuLaneMask(mask) (mask)
 
 #endif

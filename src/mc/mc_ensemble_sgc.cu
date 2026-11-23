@@ -24,12 +24,16 @@ precipitation in alloys, Phys. Rev. B 85, 184203 (2012).
 [2] B. Sadigh and P. Erhart
 Calculations of excess free energies of precipitates via direct thermodynamic
 integration across phase boundaries, Phys. Rev. B 86, 134204 (2012).
+
+Major contributors:
+  Zheyong Fan: Initial implementation.
+  dingxu2016: Corrected the composition bias in VCSGC acceptance probabilities.
 ------------------------------------------------------------------------------*/
 
 #include "mc_ensemble_sgc.cuh"
 #include "utilities/gpu_macro.cuh"
-#include <map>
 #include <cstring>
+#include <map>
 
 const std::map<std::string, double> MASS_TABLE{
   {"H", 1.0080000000},
@@ -468,7 +472,7 @@ void MC_Ensemble_SGC::compute(
       energy_difference +=
         kappa * K_B * temperature / group_size *
         (group_size * (mu_or_phi[index_new_species] - mu_or_phi[index_old_species]) +
-         2 * (num_atoms_species[index_new_species] - num_atoms_species[index_old_species]) + 1.0);
+         2 * (num_atoms_species[index_new_species] - num_atoms_species[index_old_species]) + 2.0);
     }
 
     std::uniform_real_distribution<float> r2(0, 1);

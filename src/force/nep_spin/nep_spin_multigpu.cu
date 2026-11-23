@@ -16,8 +16,8 @@
 /*----------------------------------------------------------------------------80
 Single-process spatial decomposition and multi-GPU evaluation for NEP-spin.
 
-Contributors:
-Chengbing Chen, 1747193328@qq.com
+Major contributors:
+  Chengbing Chen: Initial implementation.
 ------------------------------------------------------------------------------*/
 
 #include "model/box.cuh"
@@ -575,16 +575,5 @@ void NEP_Spin_MultiGPU::compute(
     GPU_CHECK_KERNEL
     CHECK(gpuDeviceSynchronize());
   }
-  save_force_snapshot(force, mforce);
-}
-
-void NEP_Spin_MultiGPU::save_force_snapshot(
-  const GPU_Vector<double>& force, const GPU_Vector<double>& mforce)
-{
-  if (force_snapshot_) {
-    force_snapshot_->copy_from_device(force.data());
-    mforce_snapshot_->copy_from_device(mforce.data());
-    force_snapshot_ = nullptr;
-    mforce_snapshot_ = nullptr;
-  }
+  save_force_snapshot(force, mforce, energy, virial);
 }

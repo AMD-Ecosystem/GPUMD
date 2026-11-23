@@ -13,7 +13,13 @@
     along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*----------------------------------------------------------------------------80
+Major contributors:
+  Zheyong Fan: Initial implementation.
+------------------------------------------------------------------------------*/
+
 #include "deposition.cuh"
+#include "integrate/replica/replica.cuh"
 #include "run.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
@@ -22,8 +28,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <ctime>
 #include <cstring>
+#include <ctime>
 
 void print_welcome_information();
 
@@ -42,7 +48,9 @@ int main(int argc, char* argv[])
 
   RunInput run_input("run.in");
   Deposition deposition;
-  if (!deposition.has_deposition(run_input)) {
+  if (has_multi_replica(run_input)) {
+    run_replica(run_input);
+  } else if (!deposition.has_deposition(run_input)) {
     Run run(run_input);
   } else {
     deposition.initialize(run_input);

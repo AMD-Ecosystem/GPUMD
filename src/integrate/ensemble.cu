@@ -15,6 +15,10 @@
 
 /*----------------------------------------------------------------------------80
 The abstract base class (ABC) for the ensemble classes.
+
+Major contributors:
+  Zheyong Fan: Initial implementation.
+  Shuning Pan: Separate position and velocity updates for MTTK integration.
 ------------------------------------------------------------------------------*/
 
 #include "ensemble.cuh"
@@ -305,9 +309,7 @@ static __global__ void gpu_velocity_verlet_v(
 }
 
 void Ensemble::velocity_verlet_v(
-  const double time_step,
-  const std::vector<Group>& group,
-  Atom& atom)
+  const double time_step, const std::vector<Group>& group, Atom& atom)
 {
   int n = atom.number_of_atoms;
   const int* group_pointer;
@@ -333,9 +335,7 @@ void Ensemble::velocity_verlet_v(
 }
 
 void Ensemble::velocity_verlet_x(
-  const double time_step,
-  const std::vector<Group>& group,
-  Atom& atom)
+  const double time_step, const std::vector<Group>& group, Atom& atom)
 {
   int n = atom.number_of_atoms;
   const int* group_pointer;
@@ -368,12 +368,13 @@ void Ensemble::velocity_verlet(
   const GPU_Vector<double>& mass,
   const GPU_Vector<double>& force_per_atom,
   GPU_Vector<double>& position_per_atom,
-  GPU_Vector<double>& velocity_per_atom)
+  GPU_Vector<double>& velocity_per_atom,
+  const gpuStream_t stream)
 {
   const int number_of_atoms = mass.size();
 
   if (fixed_group == -1) {
-    gpu_velocity_verlet<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+    gpu_velocity_verlet<<<(number_of_atoms - 1) / 128 + 1, 128, 0, stream>>>(
       is_step1,
       number_of_atoms,
       time_step,
@@ -388,7 +389,7 @@ void Ensemble::velocity_verlet(
       force_per_atom.data() + number_of_atoms,
       force_per_atom.data() + 2 * number_of_atoms);
   } else {
-    gpu_velocity_verlet<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+    gpu_velocity_verlet<<<(number_of_atoms - 1) / 128 + 1, 128, 0, stream>>>(
       is_step1,
       number_of_atoms,
       fixed_group,
@@ -554,7 +555,6 @@ static __global__ void gpu_find_vc_and_ke(
     }
   }
   __syncthreads();
-
 
   for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
     if (tid < offset) {

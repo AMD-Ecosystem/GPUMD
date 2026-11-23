@@ -13,8 +13,14 @@
     along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*----------------------------------------------------------------------------80
+Major contributors:
+  Shuning Pan: Initial implementation.
+------------------------------------------------------------------------------*/
+
 #include "ensemble_ti_spring.cuh"
 #include "utilities/gpu_macro.cuh"
+#include <cmath>
 
 namespace
 {
@@ -108,6 +114,8 @@ Ensemble_TI_Spring::Ensemble_TI_Spring(const std::vector<std::string>& tokens)
       auto_switch = false;
       if (!is_valid_int(tokens[i + 1], &t_switch))
         PRINT_INPUT_ERROR("Wrong inputs for t_switch keyword.");
+      if (t_switch < 1)
+        PRINT_INPUT_ERROR("tswitch must be at least 1.");
       i += 2;
     } else if (tokens[i] == "tequil") {
       if (i + 1 >= num_params)
@@ -115,6 +123,8 @@ Ensemble_TI_Spring::Ensemble_TI_Spring(const std::vector<std::string>& tokens)
       auto_switch = false;
       if (!is_valid_int(tokens[i + 1], &t_equil))
         PRINT_INPUT_ERROR("Wrong inputs for t_equil keyword.");
+      if (t_equil < 0)
+        PRINT_INPUT_ERROR("tequil must be non-negative.");
       i += 2;
     } else if (tokens[i] == "temp") {
       if (i + 1 >= num_params)
@@ -153,10 +163,8 @@ Ensemble_TI_Spring::Ensemble_TI_Spring(const std::vector<std::string>& tokens)
       PRINT_INPUT_ERROR("Unknown keyword.");
     }
   }
-  if ((t_switch < 0 && t_equil >= 0) || (t_switch >= 0 && t_equil < 0)) {
-    PRINT_INPUT_ERROR(
-      "Error: Please specify either both t_switch and t_equil, or neither (to let the program "
-      "auto-determine)");
+  if (!auto_switch && (t_switch < 0 || t_equil < 0)) {
+    PRINT_INPUT_ERROR("Specify both tswitch and tequil, or omit both.");
   }
   printf(
     "Thermostat: target temperature is %f k, t_period is %f timesteps.\n",
@@ -173,7 +181,17 @@ void Ensemble_TI_Spring::init(
   if (auto_switch) {
     t_switch = (int)(number_of_steps * 0.4);
     t_equil = (int)(number_of_steps * 0.1);
-  } else
+  }
+  if (t_switch < 1) {
+    PRINT_INPUT_ERROR("tswitch must be at least 1; increase the run length in automatic mode.");
+  }
+  if (t_equil > number_of_steps / 2 || t_switch > number_of_steps / 2 - t_equil) {
+    PRINT_INPUT_ERROR("run must be at least 2 * (tequil + tswitch) steps for TI.");
+  }
+  if (auto_k && t_equil == 0) {
+    PRINT_INPUT_ERROR("Automatic spring constants require tequil greater than zero.");
+  }
+  if (!auto_switch)
     printf("The number of steps should be set to %d!\n", 2 * (t_equil + t_switch));
   printf(
     "Nonequilibrium thermodynamic integration: t_switch is %d timestep, t_equil is %d timesteps.\n",
@@ -211,10 +229,7 @@ void Ensemble_TI_Spring::init(
 }
 
 void Ensemble_TI_Spring::find_thermo(
-  const Box& box,
-  const std::vector<Group>& group,
-  const Atom& atom,
-  GPU_Vector<double>& thermo)
+  const Box& box, const std::vector<Group>& group, const Atom& atom, GPU_Vector<double>& thermo)
 {
   Ensemble::find_thermo(
     box.get_volume(),
@@ -229,10 +244,7 @@ void Ensemble_TI_Spring::find_thermo(
   pressure = (thermo_cpu[2] + thermo_cpu[3] + thermo_cpu[4]) / 3;
 }
 
-Ensemble_TI_Spring::~Ensemble_TI_Spring(void)
-{
-  close_output_file(false);
-}
+Ensemble_TI_Spring::~Ensemble_TI_Spring(void) { close_output_file(false); }
 
 void Ensemble_TI_Spring::finalize_run(const Atom& atom, const Box& box)
 {
@@ -396,7 +408,7 @@ void Ensemble_TI_Spring::find_lambda(
       dlambda,
       pe / atom.number_of_atoms,
       espring / atom.number_of_atoms);
-    E_diff += 0.5 * (pe - espring) * abs(dlambda) / atom.number_of_atoms;
+    E_diff += 0.5 * (pe - espring) * std::abs(dlambda) / atom.number_of_atoms;
   }
 }
 
@@ -413,8 +425,7 @@ void Ensemble_TI_Spring::compute2(
   find_lambda(step, box, group, atoms, thermo);
   add_spring_force(box, atoms);
 
-  Ensemble_LAN::compute2(
-    time_step, step, number_of_steps, group, box, atoms, thermo, force);
+  Ensemble_LAN::compute2(time_step, step, number_of_steps, group, box, atoms, thermo, force);
 }
 
 double Ensemble_TI_Spring::switch_func(double t)
